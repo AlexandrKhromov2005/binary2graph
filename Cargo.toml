@@ -1,0 +1,9 @@
+[package]
+name = "binary2graph"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+object = "0.36"
+iced-x86 = "1.21"
+petgraph = "0.6"
