@@ -1,5 +1,5 @@
 use iced_x86::{Decoder, DecoderOptions, Instruction, Mnemonic, OpKind};
-use object::{Object, ObjectSection, ObjectSymbol, SymbolKind};
+use object::{Object, ObjectSection, ObjectSymbol, SymbolKind, RelocationTarget, RelocationFlags};
 use petgraph::{dot::{Config, Dot}, graph::{DiGraph, NodeIndex}};
 use std::{collections::HashMap, fs};
 
@@ -10,10 +10,104 @@ struct Function {
     size:       u64,  
 }
 
+fn read_plt_slots(file: &object::File) -> HashMap<u64, String> {
+    let mut slots: HashMap<u64, String> = HashMap::new();
+
+    let mut dynindex_to_name: HashMap<usize, String> = HashMap::new();
+    for symbol in file.dynamic_symbols() {
+        if let Ok(name) = symbol.name() {
+            if !name.is_empty() {
+                dynindex_to_name.insert(symbol.index().0, name.to_string());
+            }
+        }
+    }
+
+    let relocations = match file.dynamic_relocations() {
+        Some(iter) => iter,
+        None => return slots,
+    };
+
+    for (address, reloc) in relocations {
+        let is_jump_slot = match reloc.flags() {
+            RelocationFlags::Elf { r_type } => r_type == object::elf::R_X86_64_JUMP_SLOT,
+            _ => false,
+        };
+        if !is_jump_slot {
+            continue;
+        }
+
+        if let RelocationTarget::Symbol(sym_index) = reloc.target() {
+            if let Some(name) = dynindex_to_name.get(&sym_index.0) {
+                slots.insert(address, name.clone());
+            }
+        }
+    }
+
+    slots
+}
+
+fn read_plt_stubs(file: &object::File) -> HashMap<u64, u64> {
+    let mut stubs: HashMap<u64, u64> = HashMap::new();
+
+    let section = match file.section_by_name(".plt.sec") {
+        Some(s) => s,
+        None => return stubs,
+    };
+
+    let sec_addr = section.address();
+    let data = match section.data() {
+        Ok(d) => d,
+        Err(_) => return stubs,
+    };
+
+    let mut decoder = Decoder::with_ip(64, data, sec_addr, DecoderOptions::NONE);
+    let mut instr = Instruction::default();
+
+    let mut current_stub_start = sec_addr;
+
+    while decoder.can_decode() {
+        let ip_before = decoder.ip();
+        decoder.decode_out(&mut instr);
+        match instr.mnemonic() {
+            Mnemonic::Endbr64 => {
+                current_stub_start = ip_before;
+            }
+            Mnemonic::Jmp => {
+                if instr.op0_kind() == OpKind::Memory {
+                    let slot = instr.memory_displacement64();
+                    stubs.insert(current_stub_start,slot);
+                }
+            }
+            _ => {}
+        }
+    }
+    stubs
+}
 fn main() {
     let path = "test/test_target";
     let bytes = fs::read(path).expect("can't read file");
     let file = object::File::parse(&*bytes).expect("can't parse as object file");
+
+    let plt_slots = read_plt_slots(&file);
+
+    let plt_stubs = read_plt_stubs(&file);
+
+    let mut plt_names: HashMap<u64, String> = HashMap::new();
+    for (stub_addr, slot_addr) in &plt_stubs{
+        if let Some(name) = plt_slots.get(slot_addr) {
+            plt_names.insert(*stub_addr, name.clone());           
+        }
+    }
+
+    println!("PLT-stubs (stub address -> name):");
+    for (addr, name) in &plt_names {
+        println!("  {:#x} -> {}", addr, name);
+    }
+
+    println!("PLT-slots (slot address -> name):");
+    for (addr, name) in &plt_slots {
+        println!("  {:#x} -> {}", addr, name);
+    }
 
     let text = file.section_by_name(".text").expect("no section .text");
     let text_addr = text.address();
@@ -76,11 +170,13 @@ fn main() {
 
             if instr.mnemonic() == Mnemonic::Call && instr.op0_kind() == OpKind::NearBranch64 {
                 let target = instr.near_branch_target();
-                let callee_name = match addr_to_name.get(&target) {
-                    Some(name) => name.clone(),
-                    None => format!("sub_{:x}", target),
+                let callee_name = if let Some(name) = addr_to_name.get(&target) {
+                    name.clone()
+                } else if let Some(name) = plt_names.get(&target) {
+                    name.clone()
+                } else {
+                    format!("sub_{:x}", target)
                 };
-
                 let caller_idx = get_or_add(&mut graph, &mut node_index, &f.name);
                 let callee_idx = get_or_add(&mut graph, &mut node_index, &callee_name);
 
