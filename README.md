@@ -24,9 +24,10 @@ Options:
 
 ```
 gcc -no-pie -o test/test_target test/test_target.c
+gcc -no-pie -o test/test_calc test/test_calc.c
 binary2graph test/test_target
-binary2graph test/test_target --no-info -o app.dot --json app.json
-binary2graph test/test_target --serve 8080
+binary2graph test/test_calc --no-info -o app.dot --json app.json
+binary2graph test/test_calc --serve 8080
 ```
 
 The DOT file renders with graphviz: `dot -Tsvg callgraph.dot -o callgraph.svg`.
