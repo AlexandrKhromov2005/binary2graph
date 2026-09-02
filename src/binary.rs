@@ -25,6 +25,9 @@ pub struct BinaryInfo {
     pub kind: String,
     pub entry_point: u64,
     pub interpreter: Option<String>,
+    pub compiler: Vec<String>,  
+    pub needed_libs: Vec<String>,
+    pub stripped: bool,
     pub sections: Vec<SectionInfo>,
 }
 
@@ -192,6 +195,10 @@ pub fn load_info(file: &object::File) -> BinaryInfo {
         })
         .collect();
 
+    let compiler = read_compiler_info(file);
+    let needed_libs = read_needed_libs(file);
+    let stripped = file.symbols().next().is_none();
+
     BinaryInfo {
         format: format!("{:?}", file.format()),
         architecture: format!("{:?}", file.architecture()),
@@ -200,6 +207,9 @@ pub fn load_info(file: &object::File) -> BinaryInfo {
         kind: format!("{:?}", file.kind()),
         entry_point: file.entry(),
         interpreter,
+        compiler,
+        needed_libs,
+        stripped,
         sections,
     }
 }
@@ -217,10 +227,83 @@ impl fmt::Display for BinaryInfo {
         if let Some(interp) = &self.interpreter {
             writeln!(f, "Interpreter: {}", interp)?;
         }
+
+        if !self.compiler.is_empty() {
+            writeln!(f, "Compiler:    {}", self.compiler.join("; "))?;
+        }
+        writeln!(
+            f,
+            "Symbols:     {}",
+            if self.stripped { "stripped" } else { "present (.symtab)" }
+        )?;
+        if !self.needed_libs.is_empty() {
+            writeln!(f, "Needed libs:")?;
+            for lib in &self.needed_libs {
+                writeln!(f, "  {}", lib)?;
+            }
+        }
+
         writeln!(f, "Sections ({}):", self.sections.len())?;
         for s in &self.sections {
             writeln!(f, "  {:<20} {:#010x}  {:>8}", s.name, s.address, s.size)?;
         }
         Ok(())
     }
+}
+
+fn read_cstr(data: &[u8], offset: usize) -> Option<String> {
+    if offset >= data.len() {
+        return None;
+    }
+    let rest = &data[offset..];
+    let end = rest.iter().position(|&b| b == 0)?;
+    Some(String::from_utf8_lossy(&rest[..end]).to_string())
+}
+
+fn read_compiler_info(file: &object::File) -> Vec<String> {
+    let Some(section) = file.section_by_name(".comment") else {
+        return Vec::new();
+    };
+    let Ok(data) = section.data() else {
+        return Vec::new();
+    };
+
+    let mut comments: Vec<String> = data
+        .split(|&b| b == 0)
+        .filter(|s| !s.is_empty())
+        .map(|s| String::from_utf8_lossy(s).to_string())
+        .collect();
+    comments.sort();
+    comments.dedup();
+    comments
+}
+
+fn read_needed_libs(file: &object::File) -> Vec<String> {
+    let mut libs = Vec::new();
+
+    let (Some(dynamic), Some(dynstr)) = (
+        file.section_by_name(".dynamic"),
+        file.section_by_name(".dynstr"),
+    ) else {
+        return libs;
+    };
+    let (Ok(dyn_data), Ok(str_data)) = (dynamic.data(), dynstr.data()) else {
+        return libs;
+    };
+
+    for entry in dyn_data.chunks_exact(16) {
+        let tag = u64::from_le_bytes(entry[0..8].try_into().unwrap());
+        let val = u64::from_le_bytes(entry[8..16].try_into().unwrap());
+
+        if tag == object::elf::DT_NULL as u64 {
+            break; // конец таблицы
+        }
+        if tag == object::elf::DT_NEEDED as u64
+            && let Some(name) = read_cstr(str_data, val as usize)
+        {
+            libs.push(name);
+        }
+    }
+
+    libs
 }
