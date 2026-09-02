@@ -1,5 +1,6 @@
 mod binary;
 mod callgraph;
+mod server;
 
 use callgraph::{CallGraph, NodeKind};
 use clap::Parser;
@@ -25,6 +26,10 @@ struct Args {
     /// Write full analysis as JSON to this path
     #[arg(long)]
     json: Option<String>,
+
+    /// Serve results over HTTP on this port instead of writing files
+    #[arg(long)]
+    serve: Option<u16>,
 }
 
 
@@ -36,7 +41,8 @@ struct Report<'a> {
     graph: callgraph::GraphExport,
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let args = Args::parse();
     let path = &args.binary;
 
@@ -105,5 +111,18 @@ fn main() {
         let json = serde_json::to_string_pretty(&report).expect("can't serialize report");
         fs::write(json_path, json).expect("can't write json");
         println!("JSON saved to {}", json_path);
+    }
+
+        if let Some(port) = args.serve {
+        let report = Report {
+            binary: path,
+            info: &info,
+            functions: &functions,
+            graph: graph.export(),
+        };
+        let state = server::AppState {
+            report_json: serde_json::to_string(&report).expect("can't serialize report"),
+        };
+        server::serve(state, port).await;
     }
 }
