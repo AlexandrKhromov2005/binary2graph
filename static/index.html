@@ -33,9 +33,35 @@
     display: flex;
     min-height: 0;
   }
-  #cy {
+  #cy-wrap {
+    position: relative;
     flex: 1;
     min-width: 0;
+  }
+  #cy {
+    position: absolute;
+    inset: 0;
+  }
+  #controls {
+    position: absolute;
+    top: 8px;
+    left: 8px;
+    display: flex;
+    gap: 4px;
+  }
+  #controls button {
+    min-width: 26px;
+    height: 26px;
+    padding: 0 6px;
+    border: 1px solid #ccc;
+    background: #fff;
+    font: inherit;
+    line-height: 1;
+    color: #222;
+    cursor: pointer;
+  }
+  #controls button:hover {
+    background: #eee;
   }
   #panel {
     flex: none;
@@ -96,7 +122,14 @@
 <body>
 <div id="header"></div>
 <div id="main">
-  <div id="cy"></div>
+  <div id="cy-wrap">
+    <div id="cy"></div>
+    <div id="controls">
+      <button id="zoom-in" title="zoom in (+)">+</button>
+      <button id="zoom-out" title="zoom out (-)">-</button>
+      <button id="zoom-fit" title="fit the whole graph (0)">fit</button>
+    </div>
+  </div>
   <div id="panel"></div>
 </div>
 <script>
@@ -172,6 +205,11 @@ function renderGraph(graph) {
     container: document.getElementById("cy"),
     elements: elements,
     layout: { name: "breadthfirst", directed: true, spacingFactor: 0.8, padding: 20 },
+    // dragging a node would pull it out of the layout, so pan instead
+    autoungrabify: true,
+    wheelSensitivity: 0.2,
+    minZoom: 0.05,
+    maxZoom: 4,
     style: [
       {
         selector: "node",
@@ -206,12 +244,40 @@ function renderGraph(graph) {
     ],
   });
 
+  bindControls();
   cy.on("tap", "node", (event) => select(Number(event.target.id()), false));
   cy.on("tap", (event) => {
     if (event.target === cy) {
       reset();
     }
   });
+}
+
+function bindControls() {
+  document.getElementById("zoom-in").addEventListener("click", () => zoomBy(1.3));
+  document.getElementById("zoom-out").addEventListener("click", () => zoomBy(1 / 1.3));
+  document.getElementById("zoom-fit").addEventListener("click", fit);
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "+" || event.key === "=") {
+      zoomBy(1.3);
+    } else if (event.key === "-") {
+      zoomBy(1 / 1.3);
+    } else if (event.key === "0") {
+      fit();
+    }
+  });
+}
+
+// Zoom around the middle of the viewport, the way the buttons and keys imply.
+function zoomBy(factor) {
+  cy.zoom({
+    level: cy.zoom() * factor,
+    renderedPosition: { x: cy.width() / 2, y: cy.height() / 2 },
+  });
+}
+
+function fit() {
+  cy.fit(undefined, 20);
 }
 
 // Recentre only when the node was picked from the panel, where it may be off screen.
