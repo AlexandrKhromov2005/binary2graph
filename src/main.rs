@@ -4,9 +4,9 @@ mod server;
 
 use callgraph::{CallGraph, NodeKind};
 use clap::Parser;
+use serde::Serialize;
 use std::collections::HashMap;
 use std::fs;
-use serde::Serialize;
 
 /// Builds a function call graph from an ELF binary.
 #[derive(Parser, Debug)]
@@ -31,7 +31,6 @@ struct Args {
     #[arg(long)]
     serve: Option<u16>,
 }
-
 
 #[derive(Serialize)]
 struct Report<'a> {
@@ -95,7 +94,11 @@ async fn main() {
     println!("  functions:    {}", functions.len());
     println!("  plt entries:  {}", plt_names.len());
     println!("  direct calls: {}", calls.len());
-    println!("Graph: {} nodes, {} edges", graph.node_count(), graph.edge_count());
+    println!(
+        "Graph: {} nodes, {} edges",
+        graph.node_count(),
+        graph.edge_count()
+    );
 
     let dot = graph.to_dot();
     fs::write(&args.output, &dot).expect("can't write dot file");
@@ -113,7 +116,7 @@ async fn main() {
         println!("JSON saved to {}", json_path);
     }
 
-        if let Some(port) = args.serve {
+    if let Some(port) = args.serve {
         let report = Report {
             binary: path,
             info: &info,

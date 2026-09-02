@@ -1,4 +1,4 @@
-use axum::{extract::State, response::Html, routing::get, Json, Router};
+use axum::{Json, Router, extract::State, response::Html, routing::get};
 use std::sync::Arc;
 
 pub struct AppState {

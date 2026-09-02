@@ -1,12 +1,12 @@
 use petgraph::dot::{Config, Dot};
 use petgraph::graph::{DiGraph, NodeIndex};
-use std::collections::HashMap;
 use serde::Serialize;
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize)]
 pub enum NodeKind {
-    Local,  
-    Plt,     
+    Local,
+    Plt,
     Unknown,
 }
 

@@ -1,8 +1,13 @@
 use crate::callgraph::NodeKind;
 use iced_x86::{Decoder, DecoderOptions, Instruction, Mnemonic, OpKind};
-use object::{Object, ObjectKind, ObjectSection, ObjectSymbol, RelocationFlags, RelocationTarget, SymbolKind, Endianness, {read::elf::{ElfFile, ProgramHeader}}, {elf::{FileHeader64, PT_GNU_RELRO, PT_GNU_STACK, PF_X}}};
-use std::{collections::HashMap, fmt};
+use object::{
+    Endianness, Object, ObjectKind, ObjectSection, ObjectSymbol, RelocationFlags, RelocationTarget,
+    SymbolKind,
+    elf::{FileHeader64, PF_X, PT_GNU_RELRO, PT_GNU_STACK},
+    read::elf::{ElfFile, ProgramHeader},
+};
 use serde::Serialize;
+use std::{collections::HashMap, fmt};
 
 type Elf64<'a> = ElfFile<'a, FileHeader64<Endianness>>;
 
@@ -30,7 +35,7 @@ pub struct BinaryInfo {
     pub kind: String,
     pub entry_point: u64,
     pub interpreter: Option<String>,
-    pub compiler: Vec<String>,  
+    pub compiler: Vec<String>,
     pub needed_libs: Vec<String>,
     pub stripped: bool,
     pub instrumentation: Vec<Detection>,
@@ -40,9 +45,9 @@ pub struct BinaryInfo {
 
 #[derive(Debug, Serialize)]
 pub struct Detection {
-    pub name: String,          
-    pub symbols: Vec<String>,  
-    pub linked_lib: Option<String>, 
+    pub name: String,
+    pub symbols: Vec<String>,
+    pub linked_lib: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -79,7 +84,6 @@ pub fn index_by_address(functions: &[Function]) -> HashMap<u64, String> {
         .collect()
 }
 
-
 pub fn resolve_plt(file: &object::File) -> HashMap<u64, String> {
     let slots = read_plt_slots(file);
     let stubs = read_plt_stubs(file);
@@ -98,7 +102,9 @@ fn read_plt_slots(file: &object::File) -> HashMap<u64, String> {
 
     let mut dynindex_to_name: HashMap<usize, String> = HashMap::new();
     for symbol in file.dynamic_symbols() {
-        if let Ok(name) = symbol.name() && !name.is_empty() {
+        if let Ok(name) = symbol.name()
+            && !name.is_empty()
+        {
             dynindex_to_name.insert(symbol.index().0, name.to_string());
         }
     }
@@ -117,7 +123,9 @@ fn read_plt_slots(file: &object::File) -> HashMap<u64, String> {
             continue;
         }
 
-        if let RelocationTarget::Symbol(sym_index) = reloc.target() && let Some(name) = dynindex_to_name.get(&sym_index.0) {
+        if let RelocationTarget::Symbol(sym_index) = reloc.target()
+            && let Some(name) = dynindex_to_name.get(&sym_index.0)
+        {
             slots.insert(address, name.clone());
         }
     }
@@ -150,9 +158,9 @@ fn read_plt_stubs(file: &object::File) -> HashMap<u64, u64> {
             Mnemonic::Endbr64 => {
                 current_stub_start = ip_before;
             }
-        Mnemonic::Jmp if instr.op0_kind() == OpKind::Memory => {
-            stubs.insert(current_stub_start, instr.memory_displacement64());
-        }
+            Mnemonic::Jmp if instr.op0_kind() == OpKind::Memory => {
+                stubs.insert(current_stub_start, instr.memory_displacement64());
+            }
             _ => {}
         }
     }
@@ -177,7 +185,11 @@ pub fn load_info(file: &object::File, raw: &[u8]) -> BinaryInfo {
     let interpreter = file
         .section_by_name(".interp")
         .and_then(|s| s.data().ok())
-        .map(|d| String::from_utf8_lossy(d).trim_end_matches('\0').to_string());
+        .map(|d| {
+            String::from_utf8_lossy(d)
+                .trim_end_matches('\0')
+                .to_string()
+        });
 
     let sections = file
         .sections()
@@ -231,7 +243,11 @@ impl fmt::Display for BinaryInfo {
         writeln!(
             f,
             "Symbols:     {}",
-            if self.stripped { "stripped" } else { "present (.symtab)" }
+            if self.stripped {
+                "stripped"
+            } else {
+                "present (.symtab)"
+            }
         )?;
         if !self.needed_libs.is_empty() {
             writeln!(f, "Needed libs:")?;
@@ -258,11 +274,27 @@ impl fmt::Display for BinaryInfo {
 
         if let Some(h) = &self.hardening {
             writeln!(f, "Hardening:")?;
-            writeln!(f, "  NX:      {}", if h.nx { "enabled" } else { "DISABLED" })?;
+            writeln!(
+                f,
+                "  NX:      {}",
+                if h.nx { "enabled" } else { "DISABLED" }
+            )?;
             writeln!(f, "  RELRO:   {}", h.relro)?;
-            writeln!(f, "  Canary:  {}", if h.canary { "found" } else { "not found" })?;
-            writeln!(f, "  CET:     {}", if h.cet { "property note present" } else { "no" })?;
-            writeln!(f, "  Fortify: {}", if h.fortify { "found" } else { "not found" })?;
+            writeln!(
+                f,
+                "  Canary:  {}",
+                if h.canary { "found" } else { "not found" }
+            )?;
+            writeln!(
+                f,
+                "  CET:     {}",
+                if h.cet { "property note present" } else { "no" }
+            )?;
+            writeln!(
+                f,
+                "  Fortify: {}",
+                if h.fortify { "found" } else { "not found" }
+            )?;
             writeln!(f, "  PIE:     {}", if h.pie { "yes" } else { "no" })?;
         }
 
@@ -347,15 +379,11 @@ pub fn detect_instrumentation(file: &object::File, needed_libs: &[String]) -> Ve
         hits.sort();
         hits.dedup();
 
-        let linked_lib = lib_hint.and_then(|hint| {
-            needed_libs
-                .iter()
-                .find(|lib| lib.contains(hint))
-                .cloned()
-        });
+        let linked_lib =
+            lib_hint.and_then(|hint| needed_libs.iter().find(|lib| lib.contains(hint)).cloned());
 
         if !hits.is_empty() || linked_lib.is_some() {
-            hits.truncate(5); 
+            hits.truncate(5);
             detections.push(Detection {
                 name: name.to_string(),
                 symbols: hits,
@@ -371,7 +399,7 @@ pub fn check_hardening(file: &object::File, raw: &[u8]) -> Option<Hardening> {
     let elf: Elf64 = Elf64::parse(raw).ok()?;
     let endian = elf.endian();
 
-    let mut nx = true; 
+    let mut nx = true;
     let mut has_relro_segment = false;
 
     for ph in elf.elf_program_headers() {
@@ -385,7 +413,11 @@ pub fn check_hardening(file: &object::File, raw: &[u8]) -> Option<Hardening> {
     }
 
     let bind_now: bool = has_dynamic_flag(file, object::elf::DT_BIND_NOW as u64)
-        || has_dynamic_flag_value(file, object::elf::DT_FLAGS as u64, object::elf::DF_BIND_NOW as u64);
+        || has_dynamic_flag_value(
+            file,
+            object::elf::DT_FLAGS as u64,
+            object::elf::DF_BIND_NOW as u64,
+        );
     let relro = match (has_relro_segment, bind_now) {
         (true, true) => "full",
         (true, false) => "partial",
@@ -410,7 +442,14 @@ pub fn check_hardening(file: &object::File, raw: &[u8]) -> Option<Hardening> {
 
     let pie = file.kind() == ObjectKind::Dynamic;
 
-    Some(Hardening { nx, relro, canary, cet, fortify, pie })
+    Some(Hardening {
+        nx,
+        relro,
+        canary,
+        cet,
+        fortify,
+        pie,
+    })
 }
 
 fn has_dynamic_flag(file: &object::File, wanted_tag: u64) -> bool {
