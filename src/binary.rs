@@ -10,6 +10,8 @@ pub struct Function {
     pub name: String,
     pub address: u64,
     pub size: u64,
+    pub instructions: u32,
+    pub calls_out: u32,
 }
 #[derive(Debug)]
 pub struct SectionInfo {
@@ -60,6 +62,8 @@ pub fn load_functions(file: &object::File) -> Vec<Function> {
                 name: symbol.name().unwrap_or("<unknown>").to_string(),
                 address: symbol.address(),
                 size: symbol.size(),
+                instructions: 0,
+                calls_out: 0,
             });
         }
     }
@@ -152,39 +156,6 @@ fn read_plt_stubs(file: &object::File) -> HashMap<u64, u64> {
         }
     }
     stubs
-}
-
-pub fn extract_calls(file: &object::File, functions: &[Function]) -> Vec<(u64, u64)> {
-    let mut calls = Vec::new();
-
-    let text = match file.section_by_name(".text") {
-        Some(t) => t,
-        None => return calls,
-    };
-    let text_addr = text.address();
-    let text_end = text_addr + text.size();
-
-    for f in functions {
-        if f.size == 0 || f.address < text_addr || f.address + f.size > text_end {
-            continue;
-        }
-
-        let code = match text.data_range(f.address, f.size) {
-            Ok(Some(d)) => d,
-            _ => continue,
-        };
-
-        let mut decoder = Decoder::with_ip(64, code, f.address, DecoderOptions::NONE);
-        let mut instr = Instruction::default();
-
-        while decoder.can_decode() {
-            decoder.decode_out(&mut instr);
-            if instr.mnemonic() == Mnemonic::Call && instr.op0_kind() == OpKind::NearBranch64 {
-                calls.push((f.address, instr.near_branch_target()));
-            }
-        }
-    }
-    calls
 }
 
 pub fn resolve_target(
@@ -461,4 +432,40 @@ fn dynamic_entries<'a>(file: &'a object::File) -> impl Iterator<Item = (u64, u64
             )
         })
         .take_while(|&(tag, _)| tag != object::elf::DT_NULL as u64)
+}
+
+pub fn analyze_functions(file: &object::File, functions: &mut [Function]) -> Vec<(u64, u64)> {
+    let mut calls = Vec::new();
+
+    let text = match file.section_by_name(".text") {
+        Some(t) => t,
+        None => return calls,
+    };
+    let text_addr = text.address();
+    let text_end = text_addr + text.size();
+
+    for f in functions.iter_mut() {
+        if f.size == 0 || f.address < text_addr || f.address + f.size > text_end {
+            continue;
+        }
+
+        let code = match text.data_range(f.address, f.size) {
+            Ok(Some(d)) => d,
+            _ => continue,
+        };
+
+        let mut decoder = Decoder::with_ip(64, code, f.address, DecoderOptions::NONE);
+        let mut instr = Instruction::default();
+
+        while decoder.can_decode() {
+            decoder.decode_out(&mut instr);
+            f.instructions += 1;
+
+            if instr.mnemonic() == Mnemonic::Call && instr.op0_kind() == OpKind::NearBranch64 {
+                f.calls_out += 1;
+                calls.push((f.address, instr.near_branch_target()));
+            }
+        }
+    }
+    calls
 }
