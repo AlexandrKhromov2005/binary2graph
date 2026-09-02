@@ -1,7 +1,9 @@
 use crate::callgraph::NodeKind;
 use iced_x86::{Decoder, DecoderOptions, Instruction, Mnemonic, OpKind};
-use object::{Object, ObjectSection, ObjectSymbol, RelocationFlags, RelocationTarget, SymbolKind};
+use object::{Object, ObjectKind, ObjectSection, ObjectSymbol, RelocationFlags, RelocationTarget, SymbolKind, Endianness, {read::elf::{ElfFile, ProgramHeader}}, {elf::{FileHeader64, PT_GNU_RELRO, PT_GNU_STACK, PF_X}}};
 use std::{collections::HashMap, fmt};
+
+type Elf64<'a> = ElfFile<'a, FileHeader64<Endianness>>;
 
 #[derive(Debug)]
 pub struct Function {
@@ -30,6 +32,7 @@ pub struct BinaryInfo {
     pub stripped: bool,
     pub instrumentation: Vec<Detection>,
     pub sections: Vec<SectionInfo>,
+    pub hardening: Option<Hardening>,
 }
 
 #[derive(Debug)]
@@ -37,6 +40,16 @@ pub struct Detection {
     pub name: String,          
     pub symbols: Vec<String>,  
     pub linked_lib: Option<String>, 
+}
+
+#[derive(Debug)]
+pub struct Hardening {
+    pub nx: bool,
+    pub relro: String,
+    pub canary: bool,
+    pub cet: bool,
+    pub fortify: bool,
+    pub pie: bool,
 }
 
 pub fn load_functions(file: &object::File) -> Vec<Function> {
@@ -188,7 +201,7 @@ pub fn resolve_target(
     }
 }
 
-pub fn load_info(file: &object::File) -> BinaryInfo {
+pub fn load_info(file: &object::File, raw: &[u8]) -> BinaryInfo {
     let interpreter = file
         .section_by_name(".interp")
         .and_then(|s| s.data().ok())
@@ -207,6 +220,7 @@ pub fn load_info(file: &object::File) -> BinaryInfo {
     let needed_libs = read_needed_libs(file);
     let instrumentation = detect_instrumentation(file, &needed_libs);
     let stripped = file.symbols().next().is_none();
+    let hardening = check_hardening(file, raw);
 
     BinaryInfo {
         format: format!("{:?}", file.format()),
@@ -221,6 +235,7 @@ pub fn load_info(file: &object::File) -> BinaryInfo {
         instrumentation,
         stripped,
         sections,
+        hardening,
     }
 }
 
@@ -269,6 +284,16 @@ impl fmt::Display for BinaryInfo {
             }
         }
 
+        if let Some(h) = &self.hardening {
+            writeln!(f, "Hardening:")?;
+            writeln!(f, "  NX:      {}", if h.nx { "enabled" } else { "DISABLED" })?;
+            writeln!(f, "  RELRO:   {}", h.relro)?;
+            writeln!(f, "  Canary:  {}", if h.canary { "found" } else { "not found" })?;
+            writeln!(f, "  CET:     {}", if h.cet { "property note present" } else { "no" })?;
+            writeln!(f, "  Fortify: {}", if h.fortify { "found" } else { "not found" })?;
+            writeln!(f, "  PIE:     {}", if h.pie { "yes" } else { "no" })?;
+        }
+
         writeln!(f, "Sections ({}):", self.sections.len())?;
         for s in &self.sections {
             writeln!(f, "  {:<20} {:#010x}  {:>8}", s.name, s.address, s.size)?;
@@ -305,33 +330,17 @@ fn read_compiler_info(file: &object::File) -> Vec<String> {
 }
 
 fn read_needed_libs(file: &object::File) -> Vec<String> {
-    let mut libs = Vec::new();
-
-    let (Some(dynamic), Some(dynstr)) = (
-        file.section_by_name(".dynamic"),
-        file.section_by_name(".dynstr"),
-    ) else {
-        return libs;
+    let Some(dynstr) = file.section_by_name(".dynstr") else {
+        return Vec::new();
     };
-    let (Ok(dyn_data), Ok(str_data)) = (dynamic.data(), dynstr.data()) else {
-        return libs;
+    let Ok(str_data) = dynstr.data() else {
+        return Vec::new();
     };
 
-    for entry in dyn_data.chunks_exact(16) {
-        let tag = u64::from_le_bytes(entry[0..8].try_into().unwrap());
-        let val = u64::from_le_bytes(entry[8..16].try_into().unwrap());
-
-        if tag == object::elf::DT_NULL as u64 {
-            break; // конец таблицы
-        }
-        if tag == object::elf::DT_NEEDED as u64
-            && let Some(name) = read_cstr(str_data, val as usize)
-        {
-            libs.push(name);
-        }
-    }
-
-    libs
+    dynamic_entries(file)
+        .filter(|&(tag, _)| tag == object::elf::DT_NEEDED as u64)
+        .filter_map(|(_, val)| read_cstr(str_data, val as usize))
+        .collect()
 }
 
 pub fn detect_instrumentation(file: &object::File, needed_libs: &[String]) -> Vec<Detection> {
@@ -384,4 +393,72 @@ pub fn detect_instrumentation(file: &object::File, needed_libs: &[String]) -> Ve
     }
 
     detections
+}
+
+pub fn check_hardening(file: &object::File, raw: &[u8]) -> Option<Hardening> {
+    let elf: Elf64 = Elf64::parse(raw).ok()?;
+    let endian = elf.endian();
+
+    let mut nx = true; 
+    let mut has_relro_segment = false;
+
+    for ph in elf.elf_program_headers() {
+        let p_type = ph.p_type(endian);
+        if p_type == PT_GNU_STACK {
+            nx = ph.p_flags(endian) & PF_X == 0;
+        }
+        if p_type == PT_GNU_RELRO {
+            has_relro_segment = true;
+        }
+    }
+
+    let bind_now: bool = has_dynamic_flag(file, object::elf::DT_BIND_NOW as u64)
+        || has_dynamic_flag_value(file, object::elf::DT_FLAGS as u64, object::elf::DF_BIND_NOW as u64);
+    let relro = match (has_relro_segment, bind_now) {
+        (true, true) => "full",
+        (true, false) => "partial",
+        _ => "none",
+    }
+    .to_string();
+
+    let mut canary = false;
+    let mut fortify = false;
+    for sym in file.symbols().chain(file.dynamic_symbols()) {
+        if let Ok(name) = sym.name() {
+            if name == "__stack_chk_fail" {
+                canary = true;
+            }
+            if name.ends_with("_chk") && name.starts_with("__") && name != "__stack_chk_fail" {
+                fortify = true;
+            }
+        }
+    }
+
+    let cet = file.section_by_name(".note.gnu.property").is_some();
+
+    let pie = file.kind() == ObjectKind::Dynamic;
+
+    Some(Hardening { nx, relro, canary, cet, fortify, pie })
+}
+
+fn has_dynamic_flag(file: &object::File, wanted_tag: u64) -> bool {
+    dynamic_entries(file).any(|(tag, _)| tag == wanted_tag)
+}
+
+fn has_dynamic_flag_value(file: &object::File, wanted_tag: u64, bit: u64) -> bool {
+    dynamic_entries(file).any(|(tag, val)| tag == wanted_tag && val & bit != 0)
+}
+
+fn dynamic_entries<'a>(file: &'a object::File) -> impl Iterator<Item = (u64, u64)> + 'a {
+    file.section_by_name(".dynamic")
+        .and_then(|s| s.data().ok())
+        .unwrap_or(&[])
+        .chunks_exact(16)
+        .map(|e| {
+            (
+                u64::from_le_bytes(e[0..8].try_into().unwrap()),
+                u64::from_le_bytes(e[8..16].try_into().unwrap()),
+            )
+        })
+        .take_while(|&(tag, _)| tag != object::elf::DT_NULL as u64)
 }

@@ -10,8 +10,7 @@ fn main() {
     let bytes = fs::read(path).expect("can't read file");
     let file = object::File::parse(&*bytes).expect("can't parse as object file");
 
-    let info = binary::load_info(&file);
-    println!("=== {} ===", path);
+let info = binary::load_info(&file, &bytes);    println!("=== {} ===", path);
     print!("{}", info);
 
     let functions = binary::load_functions(&file);
