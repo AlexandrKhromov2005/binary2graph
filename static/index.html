@@ -28,21 +28,91 @@
   #header .path {
     font-weight: 600;
   }
+  #main {
+    flex: 1;
+    display: flex;
+    min-height: 0;
+  }
   #cy {
     flex: 1;
-    min-height: 0;
+    min-width: 0;
+  }
+  #panel {
+    flex: none;
+    width: 260px;
+    padding: 10px 12px;
+    border-left: 1px solid #ccc;
+    background: #fafafa;
+    overflow-y: auto;
+  }
+  #panel h2 {
+    margin: 0 0 8px;
+    font-size: 13px;
+    font-family: monospace;
+    word-break: break-all;
+  }
+  #panel h3 {
+    margin: 12px 0 4px;
+    font-size: 12px;
+    color: #666;
+  }
+  #panel dl {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 2px 10px;
+    margin: 0;
+  }
+  #panel dt {
+    color: #666;
+  }
+  #panel dd {
+    margin: 0;
+    font-family: monospace;
+  }
+  #panel ul {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+  #panel button {
+    padding: 0;
+    border: 0;
+    background: none;
+    font: inherit;
+    font-family: monospace;
+    color: #0645ad;
+    text-align: left;
+    cursor: pointer;
+  }
+  #panel button:hover {
+    text-decoration: underline;
+  }
+  #panel .hint {
+    margin: 0;
+    color: #666;
   }
 </style>
 </head>
 <body>
 <div id="header"></div>
-<div id="cy"></div>
+<div id="main">
+  <div id="cy"></div>
+  <div id="panel"></div>
+</div>
 <script>
 const KINDS = {
   Local: { color: "#a8d5ff", shape: "ellipse" },
   Plt: { color: "#ffcc99", shape: "rectangle" },
   Unknown: { color: "#dddddd", shape: "ellipse" },
 };
+
+let nodes = [];
+let functions = new Map();
+let callers = [];
+let callees = [];
+let inDeg = [];
+let outDeg = [];
+let cy = null;
 
 fetch("/api/report")
   .then((r) => r.json())
@@ -52,8 +122,26 @@ fetch("/api/report")
   });
 
 function init(report) {
+  nodes = report.graph.nodes;
+  functions = new Map(report.functions.map((f) => [f.name, f]));
+  indexEdges(report.graph.edges);
   renderHeader(report);
   renderGraph(report.graph);
+  reset();
+}
+
+// In/out counts and caller/callee lists come from the edge list, not from the function metrics.
+function indexEdges(edges) {
+  inDeg = nodes.map(() => 0);
+  outDeg = nodes.map(() => 0);
+  callers = nodes.map(() => new Set());
+  callees = nodes.map(() => new Set());
+  for (const [source, target] of edges) {
+    outDeg[source] += 1;
+    inDeg[target] += 1;
+    callees[source].add(target);
+    callers[target].add(source);
+  }
 }
 
 function renderHeader(report) {
@@ -63,26 +151,27 @@ function renderHeader(report) {
   if (names.length) {
     rest.push(names.join(", "));
   }
-  const path = document.createElement("span");
+  const path = el("span", report.binary);
   path.className = "path";
-  path.textContent = report.binary;
   const header = document.getElementById("header");
   header.replaceChildren(path, document.createTextNode("  ·  " + rest.join("  ·  ")));
 }
 
 function renderGraph(graph) {
-  const nodes = graph.nodes.map((n, i) => {
-    const style = KINDS[n.kind] || KINDS.Unknown;
-    return { data: { id: String(i), name: n.name, color: style.color, shape: style.shape } };
-  });
-  const edges = graph.edges.map(([source, target], i) => ({
-    data: { id: "e" + i, source: String(source), target: String(target) },
-  }));
+  const elements = {
+    nodes: graph.nodes.map((n, i) => {
+      const style = KINDS[n.kind] || KINDS.Unknown;
+      return { data: { id: String(i), name: n.name, color: style.color, shape: style.shape } };
+    }),
+    edges: graph.edges.map(([source, target], i) => ({
+      data: { id: "e" + i, source: String(source), target: String(target) },
+    })),
+  };
 
-  cytoscape({
+  cy = cytoscape({
     container: document.getElementById("cy"),
-    elements: { nodes: nodes, edges: edges },
-    layout: { name: "breadthfirst", directed: true, spacingFactor: 1.1, padding: 20 },
+    elements: elements,
+    layout: { name: "breadthfirst", directed: true, spacingFactor: 0.8, padding: 20 },
     style: [
       {
         selector: "node",
@@ -112,8 +201,83 @@ function renderGraph(graph) {
           "curve-style": "bezier",
         },
       },
+      { selector: ".active", style: { "border-width": 3, "border-color": "#333" } },
+      { selector: ".dim", style: { "opacity": 0.15 } },
     ],
   });
+
+  cy.on("tap", "node", (event) => select(Number(event.target.id()), false));
+  cy.on("tap", (event) => {
+    if (event.target === cy) {
+      reset();
+    }
+  });
+}
+
+// Recentre only when the node was picked from the panel, where it may be off screen.
+function select(index, center) {
+  const node = cy.getElementById(String(index));
+  cy.elements().removeClass("active dim");
+  cy.elements().difference(node.closedNeighborhood()).addClass("dim");
+  node.addClass("active");
+  if (center) {
+    cy.center(node);
+  }
+  renderPanel(index);
+}
+
+function reset() {
+  cy.elements().removeClass("active dim");
+  const hint = el("p", "click a node");
+  hint.className = "hint";
+  document.getElementById("panel").replaceChildren(hint);
+}
+
+function renderPanel(index) {
+  const node = nodes[index];
+  // Plt and unknown nodes have no function entry, so their metrics are left out.
+  const fn = functions.get(node.name);
+  const rows = document.createElement("dl");
+  addRow(rows, "kind", node.kind);
+  if (fn) {
+    addRow(rows, "address", "0x" + fn.address.toString(16));
+    addRow(rows, "size", String(fn.size));
+    addRow(rows, "instructions", String(fn.instructions));
+  }
+  addRow(rows, "in", String(inDeg[index]));
+  addRow(rows, "out", String(outDeg[index]));
+
+  const panel = document.getElementById("panel");
+  panel.replaceChildren(el("h2", node.name), rows);
+  addList(panel, "callers", callers[index]);
+  addList(panel, "callees", callees[index]);
+  panel.scrollTop = 0;
+}
+
+function addRow(rows, name, value) {
+  rows.append(el("dt", name), el("dd", value));
+}
+
+function addList(panel, title, indexes) {
+  if (indexes.size === 0) {
+    return;
+  }
+  const list = el("ul");
+  const sorted = [...indexes].sort((a, b) => nodes[a].name.localeCompare(nodes[b].name));
+  for (const index of sorted) {
+    const button = el("button", nodes[index].name);
+    button.addEventListener("click", () => select(index, true));
+    const item = el("li");
+    item.append(button);
+    list.append(item);
+  }
+  panel.append(el("h3", title), list);
+}
+
+function el(tag, text) {
+  const node = document.createElement(tag);
+  node.textContent = text;
+  return node;
 }
 </script>
 </body>
