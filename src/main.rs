@@ -5,6 +5,7 @@ use callgraph::{CallGraph, NodeKind};
 use clap::Parser;
 use std::collections::HashMap;
 use std::fs;
+use serde::Serialize;
 
 /// Builds a function call graph from an ELF binary.
 #[derive(Parser, Debug)]
@@ -20,6 +21,19 @@ struct Args {
     /// Skip the binary info passport (print only graph and stats)
     #[arg(long)]
     no_info: bool,
+
+    /// Write full analysis as JSON to this path
+    #[arg(long)]
+    json: Option<String>,
+}
+
+
+#[derive(Serialize)]
+struct Report<'a> {
+    binary: &'a str,
+    info: &'a binary::BinaryInfo,
+    functions: &'a [binary::Function],
+    graph: callgraph::GraphExport,
 }
 
 fn main() {
@@ -80,4 +94,16 @@ fn main() {
     let dot = graph.to_dot();
     fs::write(&args.output, &dot).expect("can't write dot file");
     println!("DOT saved to {}", args.output);
+
+    if let Some(json_path) = &args.json {
+        let report = Report {
+            binary: path,
+            info: &info,
+            functions: &functions,
+            graph: graph.export(),
+        };
+        let json = serde_json::to_string_pretty(&report).expect("can't serialize report");
+        fs::write(json_path, json).expect("can't write json");
+        println!("JSON saved to {}", json_path);
+    }
 }

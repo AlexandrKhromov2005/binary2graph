@@ -2,10 +2,11 @@ use crate::callgraph::NodeKind;
 use iced_x86::{Decoder, DecoderOptions, Instruction, Mnemonic, OpKind};
 use object::{Object, ObjectKind, ObjectSection, ObjectSymbol, RelocationFlags, RelocationTarget, SymbolKind, Endianness, {read::elf::{ElfFile, ProgramHeader}}, {elf::{FileHeader64, PT_GNU_RELRO, PT_GNU_STACK, PF_X}}};
 use std::{collections::HashMap, fmt};
+use serde::Serialize;
 
 type Elf64<'a> = ElfFile<'a, FileHeader64<Endianness>>;
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub struct Function {
     pub name: String,
     pub address: u64,
@@ -13,14 +14,14 @@ pub struct Function {
     pub instructions: u32,
     pub calls_out: u32,
 }
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub struct SectionInfo {
     pub name: String,
     pub address: u64,
     pub size: u64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub struct BinaryInfo {
     pub format: String,
     pub architecture: String,
@@ -37,14 +38,14 @@ pub struct BinaryInfo {
     pub hardening: Option<Hardening>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub struct Detection {
     pub name: String,          
     pub symbols: Vec<String>,  
     pub linked_lib: Option<String>, 
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub struct Hardening {
     pub nx: bool,
     pub relro: String,

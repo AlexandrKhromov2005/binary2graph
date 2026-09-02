@@ -8,3 +8,5 @@ object = "0.36"
 iced-x86 = "1.21"
 petgraph = "0.6"
 clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

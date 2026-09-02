@@ -1,15 +1,16 @@
 use petgraph::dot::{Config, Dot};
 use petgraph::graph::{DiGraph, NodeIndex};
 use std::collections::HashMap;
+use serde::Serialize;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub enum NodeKind {
     Local,  
     Plt,     
     Unknown,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Node {
     pub name: String,
     pub kind: NodeKind,
@@ -18,6 +19,12 @@ pub struct Node {
 pub struct CallGraph {
     graph: DiGraph<Node, ()>,
     node_index: HashMap<String, NodeIndex>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct GraphExport {
+    pub nodes: Vec<Node>,
+    pub edges: Vec<(usize, usize)>,
 }
 
 impl CallGraph {
@@ -86,5 +93,19 @@ impl CallGraph {
 impl Default for CallGraph {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl CallGraph {
+    pub fn export(&self) -> GraphExport {
+        GraphExport {
+            nodes: self.graph.node_weights().cloned().collect(),
+            edges: self
+                .graph
+                .edge_indices()
+                .filter_map(|e| self.graph.edge_endpoints(e))
+                .map(|(a, b)| (a.index(), b.index()))
+                .collect(),
+        }
     }
 }
