@@ -28,7 +28,15 @@ pub struct BinaryInfo {
     pub compiler: Vec<String>,  
     pub needed_libs: Vec<String>,
     pub stripped: bool,
+    pub instrumentation: Vec<Detection>,
     pub sections: Vec<SectionInfo>,
+}
+
+#[derive(Debug)]
+pub struct Detection {
+    pub name: String,          
+    pub symbols: Vec<String>,  
+    pub linked_lib: Option<String>, 
 }
 
 pub fn load_functions(file: &object::File) -> Vec<Function> {
@@ -197,6 +205,7 @@ pub fn load_info(file: &object::File) -> BinaryInfo {
 
     let compiler = read_compiler_info(file);
     let needed_libs = read_needed_libs(file);
+    let instrumentation = detect_instrumentation(file, &needed_libs);
     let stripped = file.symbols().next().is_none();
 
     BinaryInfo {
@@ -209,6 +218,7 @@ pub fn load_info(file: &object::File) -> BinaryInfo {
         interpreter,
         compiler,
         needed_libs,
+        instrumentation,
         stripped,
         sections,
     }
@@ -240,6 +250,22 @@ impl fmt::Display for BinaryInfo {
             writeln!(f, "Needed libs:")?;
             for lib in &self.needed_libs {
                 writeln!(f, "  {}", lib)?;
+            }
+        }
+
+        if self.instrumentation.is_empty() {
+            writeln!(f, "Instrumentation: none detected")?;
+        } else {
+            writeln!(f, "Instrumentation:")?;
+            for det in &self.instrumentation {
+                write!(f, "  {}", det.name)?;
+                if let Some(lib) = &det.linked_lib {
+                    write!(f, "  [linked: {}]", lib)?;
+                }
+                writeln!(f)?;
+                if !det.symbols.is_empty() {
+                    writeln!(f, "    evidence: {}", det.symbols.join(", "))?;
+                }
             }
         }
 
@@ -306,4 +332,56 @@ fn read_needed_libs(file: &object::File) -> Vec<String> {
     }
 
     libs
+}
+
+pub fn detect_instrumentation(file: &object::File, needed_libs: &[String]) -> Vec<Detection> {
+    const SIGNATURES: &[(&str, &[&str], Option<&str>)] = &[
+        ("AddressSanitizer", &["__asan_"], Some("libasan")),
+        ("ThreadSanitizer", &["__tsan_"], Some("libtsan")),
+        ("MemorySanitizer", &["__msan_"], Some("libmsan")),
+        ("UBSanitizer", &["__ubsan_"], Some("libubsan")),
+        ("LeakSanitizer", &["__lsan_"], Some("liblsan")),
+        ("SanitizerCoverage", &["__sanitizer_cov_"], None),
+        ("libFuzzer", &["LLVMFuzzerTestOneInput"], None),
+        ("AFL", &["__afl_"], None),
+        ("gcov/profiling", &["__gcov_", "__llvm_profile_"], None),
+    ];
+
+    let all_symbols: Vec<String> = file
+        .symbols()
+        .chain(file.dynamic_symbols())
+        .filter_map(|s| s.name().ok())
+        .filter(|n| !n.is_empty())
+        .map(|n| n.to_string())
+        .collect();
+
+    let mut detections = Vec::new();
+
+    for (name, prefixes, lib_hint) in SIGNATURES {
+        let mut hits: Vec<String> = all_symbols
+            .iter()
+            .filter(|sym| prefixes.iter().any(|p| sym.starts_with(p) || sym == p))
+            .cloned()
+            .collect();
+        hits.sort();
+        hits.dedup();
+
+        let linked_lib = lib_hint.and_then(|hint| {
+            needed_libs
+                .iter()
+                .find(|lib| lib.contains(hint))
+                .cloned()
+        });
+
+        if !hits.is_empty() || linked_lib.is_some() {
+            hits.truncate(5); 
+            detections.push(Detection {
+                name: name.to_string(),
+                symbols: hits,
+                linked_lib,
+            });
+        }
+    }
+
+    detections
 }

@@ -5,7 +5,7 @@ use callgraph::{CallGraph, NodeKind};
 use std::fs;
 
 fn main() {
-    let path = "test/test_target";
+    let path = "test/test_target_asan";
 
     let bytes = fs::read(path).expect("can't read file");
     let file = object::File::parse(&*bytes).expect("can't parse as object file");
