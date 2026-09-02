@@ -3,15 +3,36 @@ mod callgraph;
 
 use callgraph::{CallGraph, NodeKind};
 use std::fs;
+use clap::Parser;
+
+/// Builds a function call graph from an ELF binary.
+#[derive(Parser, Debug)]
+#[command(version, about)]
+struct Args {
+    /// Path to the binary to analyze
+    binary: String,
+
+    /// Where to write the DOT graph file
+    #[arg(short, long, default_value = "callgraph.dot")]
+    output: String,
+
+    /// Skip the binary info passport (print only graph and stats)
+    #[arg(long)]
+    no_info: bool,
+}
 
 fn main() {
-    let path = "test/test_target_asan";
+    let args =Args::parse();
+    let path = &args.binary;
 
     let bytes = fs::read(path).expect("can't read file");
     let file = object::File::parse(&*bytes).expect("can't parse as object file");
 
-let info = binary::load_info(&file, &bytes);    println!("=== {} ===", path);
-    print!("{}", info);
+    let info = binary::load_info(&file, &bytes);    
+    if !args.no_info {
+        println!("=== {} ===", path);
+        print!("{}", info);
+    }
 
     let functions = binary::load_functions(&file);
     let plt_names = binary::resolve_plt(&file);
@@ -35,6 +56,6 @@ let info = binary::load_info(&file, &bytes);    println!("=== {} ===", path);
     println!("Graph: {} nodes, {} edges", graph.node_count(), graph.edge_count());
 
     let dot = graph.to_dot();
-    fs::write("callgraph.dot", &dot).expect("can't write callgraph.dot");
+    fs::write(&args.output, &dot).expect("can't write callgraph.dot");
     println!("DOT saved to callgraph.dot");
 }

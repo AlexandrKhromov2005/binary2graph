@@ -7,3 +7,4 @@ edition = "2024"
 object = "0.36"
 iced-x86 = "1.21"
 petgraph = "0.6"
+clap = { version = "4", features = ["derive"] }
