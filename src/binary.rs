@@ -9,6 +9,24 @@ pub struct Function {
     pub address: u64,
     pub size: u64,
 }
+#[derive(Debug)]
+pub struct SectionInfo {
+    pub name: String,
+    pub address: u64,
+    pub size: u64,
+}
+
+#[derive(Debug)]
+pub struct BinaryInfo {
+    pub format: String,
+    pub architecture: String,
+    pub bits: u8,
+    pub endianness: String,
+    pub kind: String,
+    pub entry_point: u64,
+    pub interpreter: Option<String>,
+    pub sections: Vec<SectionInfo>,
+}
 
 pub fn load_functions(file: &object::File) -> Vec<Function> {
     let mut functions = Vec::new();
@@ -103,9 +121,9 @@ fn read_plt_stubs(file: &object::File) -> HashMap<u64, u64> {
             Mnemonic::Endbr64 => {
                 current_stub_start = ip_before;
             }
-            Mnemonic::Jmp if instr.op0_kind() == OpKind::Memory => {
-                stubs.insert(current_stub_start, instr.memory_displacement64());
-            }
+        Mnemonic::Jmp if instr.op0_kind() == OpKind::Memory => {
+            stubs.insert(current_stub_start, instr.memory_displacement64());
+        }
             _ => {}
         }
     }
@@ -156,5 +174,53 @@ pub fn resolve_target(
         (name.clone(), NodeKind::Plt)
     } else {
         (format!("sub_{:x}", target), NodeKind::Unknown)
+    }
+}
+
+pub fn load_info(file: &object::File) -> BinaryInfo {
+    let interpreter = file
+        .section_by_name(".interp")
+        .and_then(|s| s.data().ok())
+        .map(|d| String::from_utf8_lossy(d).trim_end_matches('\0').to_string());
+
+    let sections = file
+        .sections()
+        .map(|s| SectionInfo {
+            name: s.name().unwrap_or("<unnamed>").to_string(),
+            address: s.address(),
+            size: s.size(),
+        })
+        .collect();
+
+    BinaryInfo {
+        format: format!("{:?}", file.format()),
+        architecture: format!("{:?}", file.architecture()),
+        bits: if file.is_64() { 64 } else { 32 },
+        endianness: format!("{:?}", file.endianness()),
+        kind: format!("{:?}", file.kind()),
+        entry_point: file.entry(),
+        interpreter,
+        sections,
+    }
+}
+
+impl fmt::Display for BinaryInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(
+            f,
+            "Format:      {} ({}-bit, {} endian)",
+            self.format, self.bits, self.endianness
+        )?;
+        writeln!(f, "Arch:        {}", self.architecture)?;
+        writeln!(f, "Kind:        {}", self.kind)?;
+        writeln!(f, "Entry point: {:#x}", self.entry_point)?;
+        if let Some(interp) = &self.interpreter {
+            writeln!(f, "Interpreter: {}", interp)?;
+        }
+        writeln!(f, "Sections ({}):", self.sections.len())?;
+        for s in &self.sections {
+            writeln!(f, "  {:<20} {:#010x}  {:>8}", s.name, s.address, s.size)?;
+        }
+        Ok(())
     }
 }

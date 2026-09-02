@@ -10,6 +10,10 @@ fn main() {
     let bytes = fs::read(path).expect("can't read file");
     let file = object::File::parse(&*bytes).expect("can't parse as object file");
 
+    let info = binary::load_info(&file);
+    println!("=== {} ===", path);
+    print!("{}", info);
+
     let functions = binary::load_functions(&file);
     let plt_names = binary::resolve_plt(&file);
     let by_addr = binary::index_by_address(&functions);
