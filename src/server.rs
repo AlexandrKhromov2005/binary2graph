@@ -23,7 +23,7 @@ pub async fn serve(state: AppState, port: u16) {
 }
 
 async fn index() -> Html<&'static str> {
-    Html("<h1>binary2graph</h1><p>API: <a href=\"/api/report\">/api/report</a></p>")
+    Html(include_str!("../static/index.html"))
 }
 
 async fn report(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {

@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>binary2graph</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.30.2/cytoscape.min.js"></script>
+<style>
+  html, body {
+    height: 100%;
+    margin: 0;
+  }
+  body {
+    display: flex;
+    flex-direction: column;
+    font: 13px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+    color: #222;
+  }
+  #header {
+    flex: none;
+    padding: 8px 12px;
+    border-bottom: 1px solid #ccc;
+    background: #f5f5f5;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  #header .path {
+    font-weight: 600;
+  }
+  #cy {
+    flex: 1;
+    min-height: 0;
+  }
+</style>
+</head>
+<body>
+<div id="header"></div>
+<div id="cy"></div>
+<script>
+const KINDS = {
+  Local: { color: "#a8d5ff", shape: "ellipse" },
+  Plt: { color: "#ffcc99", shape: "rectangle" },
+  Unknown: { color: "#dddddd", shape: "ellipse" },
+};
+
+fetch("/api/report")
+  .then((r) => r.json())
+  .then(init)
+  .catch(() => {
+    document.getElementById("header").textContent = "can't load report";
+  });
+
+function init(report) {
+  renderHeader(report);
+  renderGraph(report.graph);
+}
+
+function renderHeader(report) {
+  const info = report.info;
+  const rest = [info.architecture, info.kind, info.stripped ? "stripped" : "not stripped"];
+  const names = info.instrumentation.map((d) => d.name);
+  if (names.length) {
+    rest.push(names.join(", "));
+  }
+  const path = document.createElement("span");
+  path.className = "path";
+  path.textContent = report.binary;
+  const header = document.getElementById("header");
+  header.replaceChildren(path, document.createTextNode("  ·  " + rest.join("  ·  ")));
+}
+
+function renderGraph(graph) {
+  const nodes = graph.nodes.map((n, i) => {
+    const style = KINDS[n.kind] || KINDS.Unknown;
+    return { data: { id: String(i), name: n.name, color: style.color, shape: style.shape } };
+  });
+  const edges = graph.edges.map(([source, target], i) => ({
+    data: { id: "e" + i, source: String(source), target: String(target) },
+  }));
+
+  cytoscape({
+    container: document.getElementById("cy"),
+    elements: { nodes: nodes, edges: edges },
+    layout: { name: "breadthfirst", directed: true, spacingFactor: 1.1, padding: 20 },
+    style: [
+      {
+        selector: "node",
+        style: {
+          "label": "data(name)",
+          "background-color": "data(color)",
+          "shape": "data(shape)",
+          "border-width": 1,
+          "border-color": "#555",
+          "width": "label",
+          "height": "label",
+          "padding": "8px",
+          "font-size": 10,
+          "font-family": "monospace",
+          "text-valign": "center",
+          "text-halign": "center",
+        },
+      },
+      {
+        selector: "edge",
+        style: {
+          "width": 1,
+          "line-color": "#888",
+          "target-arrow-color": "#888",
+          "target-arrow-shape": "triangle",
+          "arrow-scale": 0.8,
+          "curve-style": "bezier",
+        },
+      },
+    ],
+  });
+}
+</script>
+</body>
+</html>
