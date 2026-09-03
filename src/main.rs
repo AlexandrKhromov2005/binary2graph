@@ -1,7 +1,6 @@
 mod binary;
 mod callgraph;
 mod server;
-#[allow(dead_code)]
 mod trace;
 
 use callgraph::{CallGraph, NodeKind};
@@ -126,8 +125,14 @@ async fn main() {
             graph: graph.export(),
         };
         let report_json = serde_json::to_string(&report).expect("can't serialize report");
-        let state =
-            server::AppState::new(path.clone(), info, functions, graph.export(), report_json);
+        let state = server::AppState::new(
+            path.clone(),
+            info,
+            functions,
+            plt_names,
+            graph.export(),
+            report_json,
+        );
         server::serve(state, port).await;
     }
 }

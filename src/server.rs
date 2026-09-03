@@ -1,15 +1,17 @@
 use crate::binary::{BinaryInfo, Function};
 use crate::callgraph::{GraphExport, NodeKind};
+use crate::trace::{self, Engine, InputSpec, Symbols, Target};
 use axum::{
     Json, Router,
     extract::{Query, State},
     http::{StatusCode, header},
     response::{Html, IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
+use base64::{Engine as _, prelude::BASE64_STANDARD};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 pub struct AppState {
     pub binary: String,
@@ -26,6 +28,8 @@ pub struct AppState {
     pub report_json: String,
     pub meta_json: String,
     pub roots_json: String,
+    pub target: Target,
+    pub run_lock: Mutex<()>,
 }
 
 impl AppState {
@@ -33,6 +37,7 @@ impl AppState {
         binary: String,
         info: BinaryInfo,
         functions: Vec<Function>,
+        plt_names: HashMap<u64, String>,
         export: GraphExport,
         report_json: String,
     ) -> Self {
@@ -63,11 +68,19 @@ impl AppState {
             list.dedup();
         }
 
-        let name_to_idx = names
+        let name_to_idx: HashMap<String, usize> = names
             .iter()
             .enumerate()
             .map(|(idx, name)| (name.clone(), idx))
             .collect();
+
+        let target = Target {
+            path: binary.clone(),
+            args: Vec::new(),
+            entry_point: info.entry_point,
+            symbols: Symbols::new(&functions, &plt_names, &name_to_idx),
+            timeout: trace::TIMEOUT,
+        };
 
         let mut state = AppState {
             binary,
@@ -84,6 +97,8 @@ impl AppState {
             report_json,
             meta_json: String::new(),
             roots_json: String::new(),
+            target,
+            run_lock: Mutex::new(()),
         };
         // Neither body depends on the request, so serialising once leaves a string copy per hit.
         state.meta_json = meta_body(&state);
@@ -172,6 +187,15 @@ struct SearchQuery {
     q: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct RunRequest {
+    engine: String,
+    stdin: Option<String>,
+    #[serde(default)]
+    args: Vec<String>,
+    input_file: Option<String>,
+}
+
 fn default_depth() -> u32 {
     1
 }
@@ -194,6 +218,7 @@ pub async fn serve(state: AppState, port: u16) {
         .route("/api/neighbors", get(neighbors))
         .route("/api/search", get(search))
         .route("/api/roots", get(roots))
+        .route("/api/run", post(run))
         .with_state(shared);
 
     let addr = format!("127.0.0.1:{}", port);
@@ -320,6 +345,40 @@ async fn search(State(state): State<Arc<AppState>>, Query(query): Query<SearchQu
     let matches = hits.into_iter().take(50).map(|(_, hit)| hit).collect();
 
     Json(SearchResult { matches, total }).into_response()
+}
+
+async fn run(State(state): State<Arc<AppState>>, Json(request): Json<RunRequest>) -> Response {
+    let Some(engine) = Engine::parse(&request.engine) else {
+        return (StatusCode::BAD_REQUEST, "unknown engine").into_response();
+    };
+    let input_file = match request.input_file.map(|text| BASE64_STANDARD.decode(text)) {
+        Some(Ok(bytes)) => Some(bytes),
+        Some(Err(_)) => {
+            return (StatusCode::BAD_REQUEST, "input_file is not base64").into_response();
+        }
+        None => None,
+    };
+    let input = InputSpec {
+        stdin: request.stdin,
+        args: request.args,
+        input_file,
+    };
+
+    // A run blocks for up to the timeout and ptrace ties it to one thread, so it leaves the
+    // async runtime; the lock keeps two requests from tracing two targets at once.
+    let result = tokio::task::spawn_blocking(move || {
+        let _running = state
+            .run_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        engine.run(&state.target, &input)
+    })
+    .await;
+
+    match result {
+        Ok(result) => Json(result).into_response(),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "run failed").into_response(),
+    }
 }
 
 fn parse_dir(raw: &str) -> Option<Dir> {
