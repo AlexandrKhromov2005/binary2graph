@@ -196,7 +196,7 @@
     <div id="controls">
       <button id="zoom-in" title="zoom in (+)">+</button>
       <button id="zoom-out" title="zoom out (-)">-</button>
-      <button id="zoom-fit" title="fit the whole graph (0)">fit</button>
+      <button id="zoom-fit" title="fit the scene (0)">fit</button>
       <button id="relayout" title="lay the scene out again">layout</button>
       <button id="back" title="previous seed" disabled>back</button>
       <label><input type="checkbox" id="hide-plt"> hide plt</label>
@@ -224,11 +224,12 @@ const KINDS = {
 };
 // Past this many nodes the page starts from one seed instead of drawing the whole graph.
 const FULL_GRAPH_LIMIT = 300;
+// A hub such as a sanitizer check can have thousands of callers; one click brings in this many.
 const BUDGET = 200;
-const SEARCH_LIMIT = 50;
-const TOP_ROOTS = 10;
+// Cytoscape stays fluid at a few hundred nodes, so expansion stops here and the status says so.
 const SCENE_LIMIT = 500;
 const DAGRE = { name: "dagre", rankDir: "TB", nodeSep: 20, rankSep: 50, fit: false };
+// A wide rank wraps into lines of this many nodes, or one hub would stretch the scene into a strip.
 const PER_LINE = 12;
 
 let nodes = [];
@@ -259,7 +260,7 @@ function api(path) {
   });
 }
 
-// The meta body carries every node with its degrees but no edges, which only arrive per neighbourhood.
+// Meta lists every node with its degrees but no edges; those only arrive per neighbourhood.
 function init(meta) {
   nodes = meta.nodes;
   nodeIndex = new Map(nodes.map((n, i) => [n.name, i]));
@@ -490,10 +491,12 @@ function fit() {
   }
 }
 
-// Cytoscape caches visibility until the next render, so the hidden class is the source of truth here.
+// Cytoscape caches visibility until the next render, so the hidden class is the truth here.
 function shown() {
   const visible = cy.nodes().not(".hidden");
-  const edges = visible.connectedEdges().filter((e) => !e.source().hasClass("hidden") && !e.target().hasClass("hidden"));
+  const edges = visible
+    .connectedEdges()
+    .filter((e) => !e.source().hasClass("hidden") && !e.target().hasClass("hidden"));
   return visible.union(edges);
 }
 
@@ -554,7 +557,12 @@ function fold(folded, position) {
   const meta = cy.add({
     group: "nodes",
     classes: "meta",
-    data: { id: "external", label: "external (" + folded.length + ")", color: KINDS.Plt.color, shape: "rectangle" },
+    data: {
+      id: "external",
+      label: "external (" + folded.length + ")",
+      color: KINDS.Plt.color,
+      shape: "rectangle",
+    },
   });
   if (position) {
     meta.position(position);
@@ -665,8 +673,8 @@ function expand(index) {
   }).catch(() => setStatus("can't load neighbours of " + nodes[index].name));
 }
 
-// Only the new nodes get placed, one rank above or below the node they came from, so the rest of the
-// scene stays where the user left it.
+// Only the new nodes get placed, one rank above or below the node they came from, so the rest
+// of the scene stays where the user left it.
 function place(index, added) {
   const anchor = cy.getElementById(String(index));
   const fresh = added.nodes().not(".hidden").not(anchor);
@@ -732,7 +740,6 @@ function freeSpan(wanted, width, others) {
   return options.reduce((best, x) => (Math.abs(x - wanted) < Math.abs(best - wanted) ? x : best));
 }
 
-// Every neighbour lookup goes through here so the source can move to the server without touching the UI.
 function getNeighbors(seed, depth, dir, budget) {
   const query = "id=" + seed + "&depth=" + depth + "&dir=" + dir + "&budget=" + budget;
   return api("/api/neighbors?" + query).then((result) => ({
@@ -759,7 +766,13 @@ function merge(result) {
     fresh.push({ id, hasMore });
     freshNodes.push({
       group: "nodes",
-      data: { id: String(id), name: node.name, kind: node.kind, color: style.color, shape: style.shape },
+      data: {
+        id: String(id),
+        name: node.name,
+        kind: node.kind,
+        color: style.color,
+        shape: style.shape,
+      },
     });
   }
   const room = Math.max(0, SCENE_LIMIT - cy.nodes().not(".meta").length);

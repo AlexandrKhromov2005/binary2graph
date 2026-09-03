@@ -85,7 +85,7 @@ impl AppState {
             meta_json: String::new(),
             roots_json: String::new(),
         };
-        // Neither body depends on the request, so serialising them here leaves a string copy per hit.
+        // Neither body depends on the request, so serialising once leaves a string copy per hit.
         state.meta_json = meta_body(&state);
         state.roots_json = roots_body(&state);
         state
