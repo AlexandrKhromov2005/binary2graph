@@ -64,14 +64,37 @@ Graph: 5 nodes, 5 edges
 
 `--serve <port>` starts an HTTP server on `127.0.0.1` and keeps it in the
 foreground; the DOT file is written as usual before it comes up. `/` is a single
-page that fetches `/api/report` and draws the graph with cytoscape.js from a
-CDN, so the browser needs network access. Local functions are blue ellipses, PLT
-stubs orange rectangles, unresolved targets grey. Clicking a node highlights its
-neighbourhood and fills the side panel with address, size, instruction count,
-in/out counts and clickable caller and callee lists. `/api/report` serves the
-same report that `--json` writes.
+page that draws the graph with cytoscape.js and dagre from CDNs, so the browser
+needs network access. Local functions are blue ellipses, PLT stubs orange
+rectangles, unresolved targets grey.
+
+Graphs up to 300 nodes are drawn whole. Bigger ones open as an explorer: the
+scene starts at `main` (or the entry point) and a click on a node adds its
+direct callers and callees; a `+` after a name marks neighbours not on screen
+yet. The panel has a substring search over every function, root lists (entry
+point, exported functions, most called) that restart the scene from a new seed,
+and for the selected node its address, size, instruction count, in/out counts
+and clickable caller and callee lists. The toolbar hides PLT stubs, collapses
+PLT and unknown nodes into one `external` node, hides nodes below a degree,
+relays the scene and keeps a breadcrumb trail of seeds. One click brings in at
+most 200 neighbours and the scene holds at most 500 nodes; the status line says
+when either cut applies.
 
 ![binary2graph web UI](docs/webui.png)
+
+## HTTP API
+
+- `/api/meta`: passport, function table and every graph node with its in/out
+  degree, no edges. Loaded once when the page opens.
+- `/api/neighbors?id=N&depth=1&dir=both&budget=200`: breadth-first walk from
+  node `N` (`dir` is `out`, `in` or `both`); returns the visited ids with a
+  `has_more` flag each, the edges among them and `truncated` when the budget
+  stopped the walk.
+- `/api/search?q=text`: case-insensitive substring match over function and node
+  names, at most 50 matches plus the total count.
+- `/api/roots`: node ids of the entry point, exported functions and the ten most
+  called local functions.
+- `/api/report`: the same report that `--json` writes.
 
 ## What the passport reports
 
@@ -95,10 +118,15 @@ same report that `--json` writes.
 - Functions of zero size, or with a body outside `.text`, are skipped.
 - PLT names are read from `.plt.sec`, the layout produced with
   `-fcf-protection`. Without it, calls into the PLT stay as `sub_<address>` nodes.
+- Exported functions come from `.dynsym`, so the list is empty for an executable
+  built without `-rdynamic`.
+- The explorer shows at most 200 neighbours per click; the rest of a hub's
+  callers are reachable through search only.
 
 ## How it works
 
 `object` parses the ELF and hands over symbols, sections and dynamic
 relocations; `iced-x86` decodes each function body to count instructions and
 collect call targets; `petgraph` holds the graph and emits the DOT; `serde_json`
-serialises the full report, and `axum` serves it next to the embedded page.
+serialises the full report, and `axum` serves it next to the embedded page,
+answering neighbourhood queries from adjacency lists built at start-up.
