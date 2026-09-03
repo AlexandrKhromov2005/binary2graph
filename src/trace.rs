@@ -6,12 +6,13 @@ use nix::sys::signal::{self, Signal};
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::Pid;
 use serde::{Serialize, Serializer};
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Read, Write};
-use std::os::unix::process::CommandExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -59,6 +60,29 @@ pub struct Symbols {
     stubs: HashMap<u64, usize>,
 }
 
+#[derive(Clone, Copy)]
+pub enum Engine {
+    Ptrace,
+    Valgrind,
+}
+
+impl Engine {
+    pub fn parse(name: &str) -> Option<Engine> {
+        match name {
+            "ptrace" => Some(Engine::Ptrace),
+            "valgrind" => Some(Engine::Valgrind),
+            _ => None,
+        }
+    }
+
+    pub fn run(self, target: &Target, input: &InputSpec) -> TraceResult {
+        match self {
+            Engine::Ptrace => run_ptrace(target, input),
+            Engine::Valgrind => run_valgrind(target, input),
+        }
+    }
+}
+
 impl Symbols {
     pub fn new(
         functions: &[Function],
@@ -103,6 +127,25 @@ impl Symbols {
         let after = self.ranges.partition_point(|range| range.start <= address);
         let range = &self.ranges[after.checked_sub(1)?];
         (address < range.end).then_some(range.node)
+    }
+
+    // Callgrind prints an address inside an object it has read relative to the object's load
+    // address, but a PLT stub lies outside what it reads, so a call into one keeps the runtime
+    // bias; the bias is the page-aligned shift that lands the most call targets on a stub.
+    fn stub_shift(&self, targets: &HashSet<u64>) -> u64 {
+        let mut votes: HashMap<u64, usize> = HashMap::new();
+        for &target in targets {
+            for &stub in self.stubs.keys() {
+                let shift = target.wrapping_sub(stub);
+                if shift % 0x1000 == 0 {
+                    *votes.entry(shift).or_insert(0) += 1;
+                }
+            }
+        }
+        votes
+            .into_iter()
+            .max_by_key(|&(shift, count)| (count, Reverse(shift)))
+            .map_or(0, |(shift, _)| shift)
     }
 }
 
@@ -153,6 +196,18 @@ impl Outcome {
 
     fn signaled(signal: Signal) -> Self {
         Outcome::failed(format!("killed by {}", signal.as_str()))
+    }
+
+    fn from_status(status: ExitStatus) -> Self {
+        match (status.code(), status.signal().map(Signal::try_from)) {
+            (Some(code), _) => Outcome {
+                exit_code: Some(code),
+                error: None,
+            },
+            (None, Some(Ok(signal))) => Outcome::signaled(signal),
+            (None, Some(Err(_))) => Outcome::failed("killed by an unknown signal".to_string()),
+            (None, None) => Outcome::failed("stopped without exiting".to_string()),
+        }
     }
 }
 
@@ -371,7 +426,175 @@ fn poke_byte(pid: Pid, address: u64, byte: u8) -> nix::Result<u8> {
     Ok(word as u8)
 }
 
+pub fn run_valgrind(target: &Target, input: &InputSpec) -> TraceResult {
+    let mut trace = Trace::default();
+    let (args, input_file) = match prepare_args(target, input) {
+        Ok(prepared) => prepared,
+        Err(e) => {
+            return trace.finish(
+                Outcome::failed(format!("can't write input file: {}", e)),
+                String::new(),
+                String::new(),
+            );
+        }
+    };
+
+    let dump = temp_path("callgrind");
+    let mut command = Command::new("valgrind");
+    command
+        .args([
+            "-q",
+            "--tool=callgrind",
+            "--dump-instr=yes",
+            "--compress-pos=no",
+            "--compress-strings=no",
+            "--demangle=no",
+        ])
+        .arg(format!("--callgrind-out-file={}", dump.display()))
+        .arg(&target.path)
+        .args(&args);
+
+    let result = match launch(command, input, target.timeout) {
+        Ok(mut launch) => {
+            let mut outcome = match launch.child.wait() {
+                Ok(status) => Outcome::from_status(status),
+                Err(e) => Outcome::failed(format!("wait: {}", e)),
+            };
+            let (stdout, stderr, timed_out) = launch.finish();
+            outcome = timed_out_outcome(outcome, timed_out, target);
+            match fs::read_to_string(&dump) {
+                Ok(text) => {
+                    if let Err(message) = parse_callgrind(&text, target, &mut trace) {
+                        outcome.error.get_or_insert(message);
+                    }
+                }
+                Err(_) => {
+                    outcome
+                        .error
+                        .get_or_insert_with(|| "valgrind left no callgrind dump".to_string());
+                }
+            }
+            trace.finish(outcome, stdout, stderr)
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => trace.finish(
+            Outcome::failed("valgrind is not installed".to_string()),
+            String::new(),
+            String::new(),
+        ),
+        Err(e) => trace.finish(
+            Outcome::failed(format!("can't run valgrind: {}", e)),
+            String::new(),
+            String::new(),
+        ),
+    };
+
+    let _ = fs::remove_file(dump);
+    if let Some(path) = input_file {
+        let _ = fs::remove_file(path);
+    }
+    result
+}
+
+// Callgrind names a PLT stub by its address only and knows nothing of the graph, so the dump is
+// read by instruction address the way a ptrace run is.
+fn parse_callgrind(text: &str, target: &Target, trace: &mut Trace) -> Result<(), String> {
+    let own = fs::canonicalize(&target.path)
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| target.path.clone());
+
+    let mut has_instr = false;
+    let mut in_target = false;
+    let mut block_min: Option<u64> = None;
+    let mut blocks: Vec<u64> = Vec::new();
+    let mut calls: Vec<(u64, u64, u64)> = Vec::new();
+    let mut pending: Option<(u64, u64)> = None;
+
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("positions:") {
+            has_instr = rest.split_whitespace().next() == Some("instr");
+        } else if let Some(object) = line.strip_prefix("ob=") {
+            in_target = plain(object) == own;
+        } else if line.starts_with("fn=") {
+            blocks.extend(block_min.take());
+        } else if let Some(rest) = line.strip_prefix("calls=") {
+            let mut parts = rest.split_whitespace();
+            let count = parts.next().and_then(|count| count.parse().ok());
+            let callee = parts.next().and_then(parse_hex);
+            pending = callee.zip(count);
+        } else if line.starts_with("0x") {
+            let Some(address) = line.split_whitespace().next().and_then(parse_hex) else {
+                continue;
+            };
+            // The cost line after a call carries the call site, the rest are the block's own.
+            if let Some((callee, count)) = pending.take() {
+                calls.push((address, callee, count));
+            } else if in_target {
+                block_min = Some(block_min.map_or(address, |min| min.min(address)));
+            }
+        }
+    }
+    blocks.extend(block_min);
+    if !has_instr {
+        return Err("callgrind dump has no instruction addresses".to_string());
+    }
+
+    // Only calls made from the binary's own code vote, or the thousands of libc-internal call
+    // targets would drown the few that go through a stub.
+    let outside: HashSet<u64> = calls
+        .iter()
+        .filter(|&&(site, callee, _)| {
+            target.symbols.node_at(site).is_some() && target.symbols.node_at(callee).is_none()
+        })
+        .map(|&(_, callee, _)| callee)
+        .collect();
+    let shift = target.symbols.stub_shift(&outside);
+
+    for (site, callee, count) in calls {
+        let node = target.symbols.node_at(callee).or_else(|| {
+            target
+                .symbols
+                .stubs
+                .get(&callee.wrapping_sub(shift))
+                .copied()
+        });
+        let Some(callee) = node else {
+            continue;
+        };
+        trace.call(target.symbols.node_at(site), callee, count);
+    }
+    // The entry point is jumped to rather than called, so a block with no recorded call still
+    // counts as executed once.
+    for min in blocks {
+        if let Some(node) = target.symbols.node_at(min) {
+            trace.node_hits.entry(node).or_insert(1);
+        }
+    }
+    Ok(())
+}
+
+fn plain(value: &str) -> &str {
+    match value.strip_prefix('(') {
+        Some(rest) => rest
+            .split_once(')')
+            .map_or("", |(_, name)| name.trim_start()),
+        None => value,
+    }
+}
+
+fn parse_hex(token: &str) -> Option<u64> {
+    u64::from_str_radix(token.strip_prefix("0x")?, 16).ok()
+}
+
 static INPUT_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+fn temp_path(purpose: &str) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "binary2graph-{}-{}-{}",
+        purpose,
+        std::process::id(),
+        INPUT_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ))
+}
 
 // The upload lands in a temporary file that replaces "@@" among the arguments, the way a
 // fuzzer hands over a test case.
@@ -381,11 +604,7 @@ fn prepare_args(target: &Target, input: &InputSpec) -> io::Result<(Vec<String>, 
         return Ok((args, None));
     };
 
-    let path = std::env::temp_dir().join(format!(
-        "binary2graph-input-{}-{}",
-        std::process::id(),
-        INPUT_COUNTER.fetch_add(1, Ordering::Relaxed)
-    ));
+    let path = temp_path("input");
     fs::write(&path, bytes)?;
 
     let name = path.to_string_lossy().into_owned();
