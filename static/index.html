@@ -76,6 +76,28 @@
     background: #fafafa;
     overflow-y: auto;
   }
+  #panel input {
+    width: 100%;
+    box-sizing: border-box;
+    margin-bottom: 8px;
+    padding: 3px 6px;
+    border: 1px solid #ccc;
+    font: inherit;
+    font-family: monospace;
+  }
+  #panel .muted {
+    color: #666;
+  }
+  #roots summary {
+    margin-top: 12px;
+    color: #666;
+    cursor: pointer;
+  }
+  #node {
+    margin-top: 12px;
+    padding-top: 8px;
+    border-top: 1px solid #ddd;
+  }
   #panel h2 {
     margin: 0 0 8px;
     font-size: 13px;
@@ -136,7 +158,14 @@
       <span id="status"></span>
     </div>
   </div>
-  <div id="panel"></div>
+  <div id="panel">
+    <input id="search" type="search" placeholder="find function" autocomplete="off" spellcheck="false">
+    <ul id="results"></ul>
+    <details id="roots" open>
+      <summary>roots</summary>
+    </details>
+    <div id="node"></div>
+  </div>
 </div>
 <script>
 const KINDS = {
@@ -147,14 +176,19 @@ const KINDS = {
 // Past this many nodes the page starts from one seed instead of drawing the whole graph.
 const FULL_GRAPH_LIMIT = 300;
 const BUDGET = 200;
+const SEARCH_LIMIT = 50;
+const TOP_ROOTS = 10;
 
 let nodes = [];
 let nodeIndex = new Map();
 let functions = new Map();
+let functionList = [];
+let entryPoint = 0;
 let callers = [];
 let callees = [];
 let inDeg = [];
 let outDeg = [];
+let fullGraph = false;
 let cy = null;
 
 fetch("/api/report")
@@ -167,18 +201,23 @@ fetch("/api/report")
 function init(report) {
   nodes = report.graph.nodes;
   nodeIndex = new Map(nodes.map((n, i) => [n.name, i]));
-  functions = new Map(report.functions.map((f) => [f.name, f]));
+  functionList = report.functions;
+  functions = new Map(functionList.map((f) => [f.name, f]));
+  entryPoint = report.info.entry_point;
   indexEdges(report.graph.edges);
   renderHeader(report);
   createGraph();
+  bindSearch();
+  getRoots().then(renderRoots);
   reset();
   if (nodes.length === 0) {
     return;
   }
-  if (nodes.length <= FULL_GRAPH_LIMIT) {
+  fullGraph = nodes.length <= FULL_GRAPH_LIMIT;
+  if (fullGraph) {
     showAll();
   } else {
-    showSeed(defaultSeed(report));
+    showSeed(defaultSeed());
   }
 }
 
@@ -197,14 +236,123 @@ function indexEdges(edges) {
 }
 
 // The ELF entry point only calls __libc_start_main, so main is the better start when present.
-function defaultSeed(report) {
-  const entry = report.functions.find((f) => f.address === report.info.entry_point);
-  for (const name of ["main", entry ? entry.name : ""]) {
-    if (nodeIndex.has(name)) {
-      return nodeIndex.get(name);
+function defaultSeed() {
+  if (nodeIndex.has("main")) {
+    return nodeIndex.get("main");
+  }
+  const entry = entryNode();
+  return entry === null ? outDeg.indexOf(Math.max(...outDeg)) : entry;
+}
+
+function entryNode() {
+  const entry = functionList.find((f) => f.address === entryPoint);
+  return entry && nodeIndex.has(entry.name) ? nodeIndex.get(entry.name) : null;
+}
+
+// Search and roots go through these two so the source can move to the server without touching the UI.
+function searchNames(query) {
+  const needle = query.toLowerCase();
+  const matches = [];
+  if (needle === "") {
+    return Promise.resolve({ matches, total: 0 });
+  }
+  for (const f of functionList) {
+    const at = f.name.toLowerCase().indexOf(needle);
+    if (at >= 0) {
+      const id = nodeIndex.has(f.name) ? nodeIndex.get(f.name) : null;
+      matches.push({ name: f.name, kind: "Local", id, address: f.address, at });
     }
   }
-  return outDeg.indexOf(Math.max(...outDeg));
+  nodes.forEach((n, id) => {
+    const at = n.name.toLowerCase().indexOf(needle);
+    if (at >= 0 && n.kind !== "Local") {
+      matches.push({ name: n.name, kind: n.kind, id, address: null, at });
+    }
+  });
+  matches.sort((a, b) => a.at - b.at || a.name.localeCompare(b.name));
+  return Promise.resolve({ matches: matches.slice(0, SEARCH_LIMIT), total: matches.length });
+}
+
+function getRoots() {
+  const entry = entryNode();
+  const exported = functionList
+    .filter((f) => f.exported && nodeIndex.has(f.name))
+    .map((f) => nodeIndex.get(f.name));
+  const top = nodes
+    .map((n, id) => id)
+    .filter((id) => nodes[id].kind === "Local" && inDeg[id] > 0)
+    .sort((a, b) => inDeg[b] - inDeg[a] || a - b)
+    .slice(0, TOP_ROOTS);
+  return Promise.resolve({ entry: entry === null ? [] : [entry], exported, top });
+}
+
+function renderRoots(roots) {
+  const box = document.getElementById("roots");
+  box.replaceChildren(el("summary", "roots"));
+  addList(box, "entry point", roots.entry, showSeed);
+  addList(box, "exported", roots.exported, showSeed);
+  addList(box, "most called", roots.top, showSeed);
+}
+
+function bindSearch() {
+  const input = document.getElementById("search");
+  let pending = null;
+  input.addEventListener("input", () => {
+    clearTimeout(pending);
+    pending = setTimeout(() => searchNames(input.value.trim()).then(renderResults), 150);
+  });
+  input.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      const first = document.querySelector("#results button");
+      if (first) {
+        first.click();
+      }
+    }
+  });
+}
+
+function renderResults(result) {
+  const list = document.getElementById("results");
+  list.replaceChildren();
+  for (const match of result.matches) {
+    const button = el("button", match.name);
+    if (match.id === null) {
+      button.addEventListener("click", () => showFunction(match.name));
+    } else {
+      button.addEventListener("click", () => showSeed(match.id));
+    }
+    const item = el("li");
+    item.append(button);
+    if (match.kind !== "Local") {
+      item.append(" ", muted(match.kind.toLowerCase()));
+    } else if (match.id === null) {
+      item.append(" ", muted("no calls"));
+    }
+    list.append(item);
+  }
+  if (result.total > result.matches.length) {
+    const more = el("li");
+    more.append(muted(result.matches.length + " of " + result.total + " shown"));
+    list.append(more);
+  }
+}
+
+function muted(text) {
+  const span = el("span", text);
+  span.className = "muted";
+  return span;
+}
+
+// A function without a node never made or received a direct call, so there is nothing to draw.
+function showFunction(name) {
+  const fn = functions.get(name);
+  const rows = document.createElement("dl");
+  addRow(rows, "address", "0x" + fn.address.toString(16));
+  addRow(rows, "size", String(fn.size));
+  addRow(rows, "instructions", String(fn.instructions));
+  const hint = el("p", "no direct calls in or out");
+  hint.className = "hint";
+  document.getElementById("node").replaceChildren(el("h2", name), rows, hint);
 }
 
 function renderHeader(report) {
@@ -275,6 +423,9 @@ function bindControls() {
   document.getElementById("zoom-out").addEventListener("click", () => zoomBy(1 / 1.3));
   document.getElementById("zoom-fit").addEventListener("click", fit);
   document.addEventListener("keydown", (event) => {
+    if (event.target.tagName === "INPUT") {
+      return;
+    }
     if (event.key === "+" || event.key === "=") {
       zoomBy(1.3);
     } else if (event.key === "-") {
@@ -310,6 +461,10 @@ function showAll() {
 }
 
 function showSeed(index) {
+  if (fullGraph) {
+    select(index, true);
+    return;
+  }
   cy.elements().remove();
   expand(index).then(() => {
     fit();
@@ -456,7 +611,7 @@ function reset() {
   cy.nodes().removeClass("active");
   const hint = el("p", "click a node to expand it");
   hint.className = "hint";
-  document.getElementById("panel").replaceChildren(hint);
+  document.getElementById("node").replaceChildren(hint);
 }
 
 function renderPanel(index) {
@@ -473,36 +628,39 @@ function renderPanel(index) {
   addRow(rows, "in", String(inDeg[index]));
   addRow(rows, "out", String(outDeg[index]));
 
-  const panel = document.getElementById("panel");
-  panel.replaceChildren(el("h2", node.name), rows);
+  const box = document.getElementById("node");
+  box.replaceChildren(el("h2", node.name), rows);
   const scene = cy.getElementById(String(index));
-  addList(panel, "callers", sceneIds(scene.incomers("node")));
-  addList(panel, "callees", sceneIds(scene.outgoers("node")));
-  panel.scrollTop = 0;
+  addList(box, "callers", sceneIds(scene.incomers("node")), (id) => select(id, true));
+  addList(box, "callees", sceneIds(scene.outgoers("node")), (id) => select(id, true));
+  box.scrollIntoView();
 }
 
 function sceneIds(collection) {
-  return collection.map((n) => Number(n.id()));
+  return collection.map((n) => Number(n.id())).sort(byName);
+}
+
+function byName(a, b) {
+  return nodes[a].name.localeCompare(nodes[b].name);
 }
 
 function addRow(rows, name, value) {
   rows.append(el("dt", name), el("dd", value));
 }
 
-function addList(panel, title, indexes) {
+function addList(box, title, indexes, pick) {
   if (indexes.length === 0) {
     return;
   }
   const list = el("ul");
-  const sorted = [...indexes].sort((a, b) => nodes[a].name.localeCompare(nodes[b].name));
-  for (const index of sorted) {
+  for (const index of indexes) {
     const button = el("button", nodes[index].name);
-    button.addEventListener("click", () => select(index, true));
+    button.addEventListener("click", () => pick(index));
     const item = el("li");
     item.append(button);
     list.append(item);
   }
-  panel.append(el("h3", title), list);
+  box.append(el("h3", title), list);
 }
 
 function el(tag, text) {
