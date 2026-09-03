@@ -119,7 +119,9 @@
     background: #fafafa;
     overflow-y: auto;
   }
-  #panel input {
+  #panel input,
+  #panel textarea,
+  #panel select {
     width: 100%;
     box-sizing: border-box;
     margin-bottom: 8px;
@@ -128,13 +130,49 @@
     font: inherit;
     font-family: monospace;
   }
+  #panel textarea {
+    resize: vertical;
+  }
   #panel .muted {
     color: #666;
   }
-  #roots summary {
+  #roots summary,
+  #run summary {
     margin-top: 12px;
     color: #666;
     cursor: pointer;
+  }
+  #run-button {
+    padding: 3px 10px;
+    border: 1px solid #ccc;
+    background: #fff;
+    font-family: inherit;
+    color: #222;
+  }
+  #run-button:hover {
+    background: #eee;
+    text-decoration: none;
+  }
+  #run-button:disabled {
+    color: #999;
+    cursor: default;
+  }
+  #run-status {
+    margin-top: 6px;
+  }
+  #run-status.error {
+    color: #a00;
+  }
+  #run pre {
+    max-height: 10em;
+    overflow: auto;
+    margin: 0;
+    padding: 4px 6px;
+    border: 1px solid #ddd;
+    background: #fff;
+    font-size: 12px;
+    white-space: pre-wrap;
+    word-break: break-all;
   }
   #node {
     margin-top: 12px;
@@ -202,6 +240,8 @@
       <label><input type="checkbox" id="hide-plt"> hide plt</label>
       <label><input type="checkbox" id="collapse"> collapse external</label>
       <label>min degree <input type="number" id="min-degree" min="0" value="0"></label>
+      <label><input type="checkbox" id="show-trace" checked disabled> trace</label>
+      <label><input type="checkbox" id="only-executed" disabled> only executed</label>
       <span id="trail"></span>
       <span id="status"></span>
     </div>
@@ -212,6 +252,22 @@
     <ul id="results"></ul>
     <details id="roots" open>
       <summary>roots</summary>
+    </details>
+    <details id="run" open>
+      <summary>run</summary>
+      <select id="engine">
+        <option value="ptrace">ptrace</option>
+        <option value="valgrind">valgrind</option>
+      </select>
+      <textarea id="stdin" rows="3" placeholder="stdin" spellcheck="false"></textarea>
+      <input id="args" placeholder="arguments, @@ is the input file" autocomplete="off" spellcheck="false">
+      <input type="file" id="input-file">
+      <button id="run-button">run</button>
+      <p id="run-status" class="hint"></p>
+      <h3 id="stdout-title" hidden>stdout</h3>
+      <pre id="stdout" hidden></pre>
+      <h3 id="stderr-title" hidden>stderr</h3>
+      <pre id="stderr" hidden></pre>
     </details>
     <div id="node"></div>
   </div>
@@ -242,7 +298,9 @@ let outDeg = [];
 let fullGraph = false;
 let seed = null;
 let history = [];
-const filters = { hidePlt: false, collapse: false, minDegree: 0 };
+const filters = { hidePlt: false, collapse: false, minDegree: 0, onlyExecuted: false };
+let trace = null;
+let showTrace = true;
 let cy = null;
 
 api("/api/meta")
@@ -251,10 +309,17 @@ api("/api/meta")
     document.getElementById("header").textContent = "can't load report";
   });
 
-function api(path) {
-  return fetch(path).then((r) => {
+function api(path, body) {
+  const options = body === undefined ? {} : {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  };
+  return fetch(path, options).then((r) => {
     if (!r.ok) {
-      throw new Error(r.statusText);
+      return r.text().then((text) => {
+        throw new Error(text || r.statusText);
+      });
     }
     return r.json();
   });
@@ -272,6 +337,7 @@ function init(meta) {
   renderHeader(meta);
   createGraph();
   bindSearch();
+  bindRun();
   getRoots().then(renderRoots);
   reset();
   if (nodes.length === 0) {
@@ -367,6 +433,89 @@ function muted(text) {
   return span;
 }
 
+function bindRun() {
+  document.getElementById("run-button").addEventListener("click", startRun);
+}
+
+function startRun() {
+  const request = {
+    engine: document.getElementById("engine").value,
+    stdin: document.getElementById("stdin").value || null,
+    args: document.getElementById("args").value.split(/\s+/).filter(Boolean),
+  };
+  const button = document.getElementById("run-button");
+  button.disabled = true;
+  setRunStatus("running", false);
+  readFile(document.getElementById("input-file").files[0])
+    .then((encoded) => {
+      request.input_file = encoded;
+      return api("/api/run", request);
+    })
+    .then(showRun)
+    .catch((error) => setRunStatus(error.message, true))
+    .finally(() => {
+      button.disabled = false;
+    });
+}
+
+// A data URL starts with the type of the file; the server only wants the base64 after the comma.
+function readFile(file) {
+  if (!file) {
+    return Promise.resolve(null);
+  }
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result.slice(reader.result.indexOf(",") + 1));
+    reader.onerror = () => reject(new Error("can't read " + file.name));
+    reader.readAsDataURL(file);
+  });
+}
+
+// A crashed or timed out run still reports what ran before, so the overlay is applied either way.
+function showRun(result) {
+  trace = {
+    nodeHits: new Map(Object.entries(result.node_hits).map(([id, hits]) => [Number(id), hits])),
+    edgeHits: new Map(Object.entries(result.edge_hits)),
+  };
+  const notes = [result.exit_code === null ? "no exit code" : "exit code " + result.exit_code];
+  if (result.error !== null) {
+    notes.push(result.error);
+  }
+  setRunStatus(notes.join("; "), result.error !== null);
+  showOutput("stdout", result.stdout);
+  showOutput("stderr", result.stderr);
+  document.getElementById("show-trace").disabled = false;
+  document.getElementById("only-executed").disabled = false;
+
+  // The explorer scene has only what was expanded, so the trace is brought in for the filter.
+  let changed = false;
+  if (!fullGraph) {
+    const executed = result.executed_nodes.map((id) => ({ id, hasMore: true }));
+    const { added, skipped } = merge({ nodes: executed, edges: result.executed_edges, truncated: false });
+    setStatus(skipped ? "scene limit of " + SCENE_LIMIT + " nodes reached, " + skipped + " left out" : "");
+    changed = added.length > 0;
+  }
+  applyTrace();
+  if (changed || filters.onlyExecuted) {
+    refilter();
+  }
+  if (seed !== null && cy.getElementById(String(seed)).hasClass("active")) {
+    renderPanel(seed);
+  }
+}
+
+function setRunStatus(text, error) {
+  const status = document.getElementById("run-status");
+  status.textContent = text;
+  status.classList.toggle("error", error);
+}
+
+function showOutput(name, text) {
+  document.getElementById(name).textContent = text;
+  document.getElementById(name).hidden = text === "";
+  document.getElementById(name + "-title").hidden = text === "";
+}
+
 // A function without a node never made or received a direct call, so there is nothing to draw.
 function showFunction(name) {
   const fn = functions.get(name);
@@ -432,6 +581,22 @@ function createGraph() {
           "curve-style": "bezier",
         },
       },
+      { selector: "node.executed", style: { "border-width": 3, "border-color": "#2e7d32" } },
+      {
+        selector: "edge.executed",
+        style: {
+          "width": 3,
+          "line-color": "#2e7d32",
+          "target-arrow-color": "#2e7d32",
+          "label": "data(hits)",
+          "color": "#2e7d32",
+          "font-size": 9,
+          "min-zoomed-font-size": 8,
+          "text-rotation": "autorotate",
+          "text-background-color": "#fff",
+          "text-background-opacity": 1,
+        },
+      },
       { selector: ".active", style: { "border-width": 3, "border-color": "#333" } },
       { selector: ".hidden", style: { "display": "none" } },
     ],
@@ -460,7 +625,7 @@ function bindControls() {
   document.getElementById("relayout").addEventListener("click", layout);
   document.getElementById("back").addEventListener("click", back);
   document.addEventListener("keydown", (event) => {
-    if (event.target.tagName === "INPUT") {
+    if (["INPUT", "TEXTAREA", "SELECT"].includes(event.target.tagName)) {
       return;
     }
     if (event.key === "+" || event.key === "=") {
@@ -513,6 +678,14 @@ function bindFilters() {
     filters.minDegree = Number(event.target.value) || 0;
     refilter();
   });
+  document.getElementById("show-trace").addEventListener("change", (event) => {
+    showTrace = event.target.checked;
+    applyTrace();
+  });
+  document.getElementById("only-executed").addEventListener("change", (event) => {
+    filters.onlyExecuted = event.target.checked;
+    refilter();
+  });
 }
 
 function setCollapse(on) {
@@ -542,6 +715,8 @@ function applyFilters() {
       hidden = true;
       folded.push(node);
     } else if (id !== seed && inDeg[id] + outDeg[id] < filters.minDegree) {
+      hidden = true;
+    } else if (id !== seed && filters.onlyExecuted && !(trace && trace.nodeHits.has(id))) {
       hidden = true;
     }
     node.toggleClass("hidden", hidden);
@@ -798,12 +973,46 @@ function merge(result) {
       });
     }
   }
-  return { added: added.union(cy.add(freshEdges)), skipped };
+  const merged = added.union(cy.add(freshEdges));
+  applyTrace(merged);
+  return { added: merged, skipped };
 }
 
 function setMore(node, more) {
   node.data("more", more);
-  node.data("label", more ? node.data("name") + " +" : node.data("name"));
+  relabel(node);
+}
+
+function relabel(node) {
+  let label = node.data("name");
+  if (node.data("hits") !== undefined) {
+    label += " ×" + node.data("hits");
+  }
+  if (node.data("more")) {
+    label += " +";
+  }
+  node.data("label", label);
+}
+
+// The trace stays in the page, so a node that arrives later still gets its mark and count.
+function applyTrace(eles = cy.elements()) {
+  const on = trace !== null && showTrace;
+  for (const node of eles.nodes().not(".meta")) {
+    setHits(node, on ? trace.nodeHits.get(Number(node.id())) : undefined);
+    relabel(node);
+  }
+  for (const edge of eles.edges().not(".meta")) {
+    setHits(edge, on ? trace.edgeHits.get(edge.id()) : undefined);
+  }
+}
+
+function setHits(ele, hits) {
+  if (hits === undefined) {
+    ele.removeData("hits");
+  } else {
+    ele.data("hits", hits);
+  }
+  ele.toggleClass("executed", hits !== undefined);
 }
 
 function layout() {
@@ -840,6 +1049,9 @@ function renderPanel(index) {
   }
   addRow(rows, "in", String(inDeg[index]));
   addRow(rows, "out", String(outDeg[index]));
+  if (trace && trace.nodeHits.has(index)) {
+    addRow(rows, "hits", String(trace.nodeHits.get(index)));
+  }
 
   const box = document.getElementById("node");
   box.replaceChildren(el("h2", node.name), rows);
