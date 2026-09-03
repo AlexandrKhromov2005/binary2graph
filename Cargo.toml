@@ -1,6 +1,6 @@
 [package]
 name = "binary2graph"
-version = "0.6.1"
+version = "0.7.0"
 edition = "2024"
 
 [dependencies]
@@ -12,3 +12,4 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
+nix = { version = "0.31", features = ["process", "ptrace", "signal"] }

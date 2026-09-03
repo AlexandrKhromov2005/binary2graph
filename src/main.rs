@@ -1,6 +1,8 @@
 mod binary;
 mod callgraph;
 mod server;
+#[allow(dead_code)]
+mod trace;
 
 use callgraph::{CallGraph, NodeKind};
 use clap::Parser;
