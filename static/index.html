@@ -5,6 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>binary2graph</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.30.2/cytoscape.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/dagre/0.8.5/dagre.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/cytoscape-dagre@2.5.0/cytoscape-dagre.js"></script>
 <style>
   html, body {
     height: 100%;
@@ -34,20 +36,23 @@
     min-height: 0;
   }
   #cy-wrap {
-    position: relative;
+    display: flex;
+    flex-direction: column;
     flex: 1;
     min-width: 0;
   }
   #cy {
-    position: absolute;
-    inset: 0;
+    flex: 1;
+    min-height: 0;
   }
   #controls {
-    position: absolute;
-    top: 8px;
-    left: 8px;
+    flex: none;
     display: flex;
+    flex-wrap: wrap;
+    align-items: center;
     gap: 4px;
+    padding: 6px 8px;
+    border-bottom: 1px solid #ddd;
   }
   #controls button {
     min-width: 26px;
@@ -76,6 +81,30 @@
   #controls input[type="number"] {
     width: 3em;
     font: inherit;
+  }
+  #controls button:disabled {
+    color: #999;
+    cursor: default;
+  }
+  #trail {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding-left: 6px;
+    font-family: monospace;
+  }
+  #trail button {
+    min-width: 0;
+    height: auto;
+    padding: 0;
+    border: 0;
+    background: none;
+    font-family: monospace;
+    color: #0645ad;
+  }
+  #trail button:hover {
+    background: none;
+    text-decoration: underline;
   }
   #status {
     padding-left: 6px;
@@ -164,16 +193,19 @@
 <div id="header"></div>
 <div id="main">
   <div id="cy-wrap">
-    <div id="cy"></div>
     <div id="controls">
       <button id="zoom-in" title="zoom in (+)">+</button>
       <button id="zoom-out" title="zoom out (-)">-</button>
       <button id="zoom-fit" title="fit the whole graph (0)">fit</button>
+      <button id="relayout" title="lay the scene out again">layout</button>
+      <button id="back" title="previous seed" disabled>back</button>
       <label><input type="checkbox" id="hide-plt"> hide plt</label>
       <label><input type="checkbox" id="collapse"> collapse external</label>
       <label>min degree <input type="number" id="min-degree" min="0" value="0"></label>
+      <span id="trail"></span>
       <span id="status"></span>
     </div>
+    <div id="cy"></div>
   </div>
   <div id="panel">
     <input id="search" type="search" placeholder="find function" autocomplete="off" spellcheck="false">
@@ -196,6 +228,8 @@ const BUDGET = 200;
 const SEARCH_LIMIT = 50;
 const TOP_ROOTS = 10;
 const SCENE_LIMIT = 500;
+const DAGRE = { name: "dagre", rankDir: "TB", nodeSep: 20, rankSep: 50, fit: false };
+const PER_LINE = 12;
 
 let nodes = [];
 let nodeIndex = new Map();
@@ -208,6 +242,7 @@ let inDeg = [];
 let outDeg = [];
 let fullGraph = false;
 let seed = null;
+let history = [];
 const filters = { hidePlt: false, collapse: false, minDegree: 0 };
 let cy = null;
 
@@ -396,6 +431,8 @@ function createGraph() {
     wheelSensitivity: 0.2,
     minZoom: 0.05,
     maxZoom: 4,
+    hideEdgesOnViewport: true,
+    textureOnViewport: true,
     style: [
       {
         selector: "node",
@@ -409,6 +446,7 @@ function createGraph() {
           "height": "label",
           "padding": "8px",
           "font-size": 10,
+          "min-zoomed-font-size": 8,
           "font-family": "monospace",
           "text-valign": "center",
           "text-halign": "center",
@@ -450,6 +488,8 @@ function bindControls() {
   document.getElementById("zoom-in").addEventListener("click", () => zoomBy(1.3));
   document.getElementById("zoom-out").addEventListener("click", () => zoomBy(1 / 1.3));
   document.getElementById("zoom-fit").addEventListener("click", fit);
+  document.getElementById("relayout").addEventListener("click", layout);
+  document.getElementById("back").addEventListener("click", back);
   document.addEventListener("keydown", (event) => {
     if (event.target.tagName === "INPUT") {
       return;
@@ -472,8 +512,14 @@ function zoomBy(factor) {
   });
 }
 
+// A scene of a few nodes would otherwise fill the viewport with huge labels.
 function fit() {
-  cy.fit(shown(), 20);
+  const eles = shown();
+  cy.fit(eles, 20);
+  if (cy.zoom() > 1.5) {
+    cy.zoom(1.5);
+    cy.center(eles);
+  }
 }
 
 // Cytoscape caches visibility until the next render, so the hidden class is the source of truth here.
@@ -512,6 +558,8 @@ function refilter() {
 // Filtered nodes stay in the scene but hidden, so switching a filter off needs no new lookup.
 function applyFilters() {
   const folded = [];
+  const meta = cy.getElementById("external");
+  const position = meta.nonempty() ? Object.assign({}, meta.position()) : null;
   cy.remove(".meta");
   for (const node of cy.nodes()) {
     const id = Number(node.id());
@@ -528,17 +576,21 @@ function applyFilters() {
     node.toggleClass("hidden", hidden);
   }
   if (folded.length) {
-    fold(folded);
+    return fold(folded, position);
   }
+  return cy.collection();
 }
 
 // Plt and unknown nodes are only ever callees, so every edge into the group points at the one node.
-function fold(folded) {
-  cy.add({
+function fold(folded, position) {
+  const meta = cy.add({
     group: "nodes",
     classes: "meta",
     data: { id: "external", label: "external (" + folded.length + ")", color: KINDS.Plt.color, shape: "rectangle" },
   });
+  if (position) {
+    meta.position(position);
+  }
   const sources = new Set();
   for (const node of folded) {
     for (const edge of node.incomers("edge")) {
@@ -554,6 +606,7 @@ function fold(folded) {
       data: { id: id + "-external", source: id, target: "external" },
     });
   }
+  return position ? cy.collection() : meta;
 }
 
 function showAll() {
@@ -573,13 +626,50 @@ function showSeed(index) {
     select(index, true);
     return;
   }
+  if (history[history.length - 1] !== index) {
+    history.push(index);
+  }
+  openSeed(index);
+}
+
+function openSeed(index) {
   cy.elements().remove();
   seed = index;
+  renderTrail();
   expand(index).then(() => {
     fit();
     highlight(index);
     renderPanel(index);
   });
+}
+
+function back() {
+  if (history.length < 2) {
+    return;
+  }
+  history.pop();
+  openSeed(history[history.length - 1]);
+}
+
+function renderTrail() {
+  const trail = document.getElementById("trail");
+  trail.replaceChildren();
+  history.forEach((index, at) => {
+    if (at > 0) {
+      trail.append(muted(">"));
+    }
+    if (at === history.length - 1) {
+      trail.append(el("span", nodes[index].name));
+      return;
+    }
+    const button = el("button", nodes[index].name);
+    button.addEventListener("click", () => {
+      history.splice(at + 1);
+      openSeed(index);
+    });
+    trail.append(button);
+  });
+  document.getElementById("back").disabled = history.length < 2;
 }
 
 // Recentre only when the node was picked from the panel, where it may be off screen.
@@ -605,10 +695,76 @@ function expand(index) {
     }
     setStatus(notes.join("; "));
     if (added.length) {
-      applyFilters();
-      layout();
+      place(index, added.union(applyFilters()));
     }
   });
+}
+
+// Only the new nodes get placed, one rank above or below the node they came from, so the rest of the
+// scene stays where the user left it.
+function place(index, added) {
+  const anchor = cy.getElementById(String(index));
+  const fresh = added.nodes().not(".hidden").not(anchor);
+  const callees = fresh.filter((node) => anchor.edgesTo(node).nonempty());
+  placeRank(anchor, callees, 1);
+  placeRank(anchor, fresh.not(callees), -1);
+}
+
+function placeRank(anchor, row, direction) {
+  if (row.empty()) {
+    return;
+  }
+  const step = anchor.outerHeight() + DAGRE.rankSep;
+  const lines = [];
+  for (let at = 0; at < row.length; at += PER_LINE) {
+    lines.push(row.slice(at, at + PER_LINE));
+  }
+  const width = Math.max(...lines.map(lineWidth));
+  const top = anchor.position("y") + direction * step;
+  const bottom = top + direction * step * (lines.length - 1);
+  const others = cy.nodes().not(".hidden").not(row).filter((node) => {
+    const y = node.position("y");
+    return Math.min(top, bottom) - step / 2 < y && y < Math.max(top, bottom) + step / 2;
+  });
+  const left = freeSpan(anchor.position("x") - width / 2, width, others);
+  lines.forEach((line, at) => {
+    let x = left + (width - lineWidth(line)) / 2;
+    for (const node of line) {
+      node.position({ x: x + node.outerWidth() / 2, y: top + direction * step * at });
+      x += node.outerWidth() + DAGRE.nodeSep;
+    }
+  });
+}
+
+function lineWidth(line) {
+  return line.reduce((sum, node) => sum + node.outerWidth(), 0) + DAGRE.nodeSep * (line.length - 1);
+}
+
+// The block goes into the gap nearest to where it would be centred, so expansions stay compact.
+function freeSpan(wanted, width, others) {
+  const gap = DAGRE.nodeSep;
+  const taken = others
+    .map((node) => [node.boundingBox().x1 - gap, node.boundingBox().x2 + gap])
+    .sort((a, b) => a[0] - b[0]);
+  const spans = [];
+  for (const [x1, x2] of taken) {
+    const last = spans[spans.length - 1];
+    if (last && x1 <= last[1]) {
+      last[1] = Math.max(last[1], x2);
+    } else {
+      spans.push([x1, x2]);
+    }
+  }
+  const options = [];
+  let left = -Infinity;
+  for (const [x1, x2] of spans) {
+    if (x1 - left >= width) {
+      options.push(Math.min(Math.max(wanted, left), x1 - width));
+    }
+    left = x2;
+  }
+  options.push(Math.max(wanted, left));
+  return options.reduce((best, x) => (Math.abs(x - wanted) < Math.abs(best - wanted) ? x : best));
 }
 
 // Every neighbour lookup goes through here so the source can move to the server without touching the UI.
@@ -717,7 +873,8 @@ function setMore(node, more) {
 }
 
 function layout() {
-  shown().layout({ name: "breadthfirst", directed: true, spacingFactor: 0.8, padding: 20 }).run();
+  shown().layout(DAGRE).run();
+  fit();
 }
 
 function highlight(index) {
