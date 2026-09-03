@@ -1,6 +1,6 @@
 use crate::binary::{BinaryInfo, Function};
 use crate::callgraph::{GraphExport, NodeKind};
-use crate::trace::{self, Engine, InputSpec, Symbols, Target};
+use crate::trace::{Engine, InputSpec, Target};
 use axum::{
     Json, Router,
     extract::{Query, State},
@@ -37,7 +37,7 @@ impl AppState {
         binary: String,
         info: BinaryInfo,
         functions: Vec<Function>,
-        plt_names: HashMap<u64, String>,
+        target: Target,
         export: GraphExport,
         report_json: String,
     ) -> Self {
@@ -68,19 +68,11 @@ impl AppState {
             list.dedup();
         }
 
-        let name_to_idx: HashMap<String, usize> = names
+        let name_to_idx = names
             .iter()
             .enumerate()
             .map(|(idx, name)| (name.clone(), idx))
             .collect();
-
-        let target = Target {
-            path: binary.clone(),
-            args: Vec::new(),
-            entry_point: info.entry_point,
-            symbols: Symbols::new(&functions, &plt_names, &name_to_idx),
-            timeout: trace::TIMEOUT,
-        };
 
         let mut state = AppState {
             binary,

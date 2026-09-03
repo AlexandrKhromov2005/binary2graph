@@ -1,4 +1,5 @@
 use crate::binary::Function;
+use crate::callgraph::Node;
 use nix::errno::Errno;
 use nix::libc::{AT_ENTRY, c_long};
 use nix::sys::ptrace::{self, AddressType, Options};
@@ -47,6 +48,29 @@ pub struct Target {
     pub entry_point: u64,
     pub symbols: Symbols,
     pub timeout: Duration,
+}
+
+impl Target {
+    pub fn new(
+        path: String,
+        entry_point: u64,
+        functions: &[Function],
+        plt_names: &HashMap<u64, String>,
+        nodes: &[Node],
+    ) -> Self {
+        let name_to_idx: HashMap<String, usize> = nodes
+            .iter()
+            .enumerate()
+            .map(|(idx, node)| (node.name.clone(), idx))
+            .collect();
+        Target {
+            path,
+            args: Vec::new(),
+            entry_point,
+            symbols: Symbols::new(functions, plt_names, &name_to_idx),
+            timeout: TIMEOUT,
+        }
+    }
 }
 
 struct Range {

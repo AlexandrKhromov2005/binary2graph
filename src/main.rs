@@ -8,6 +8,7 @@ use clap::Parser;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::fs;
+use trace::{Engine, InputSpec, Target, TraceResult};
 
 /// Builds a function call graph from an ELF binary.
 #[derive(Parser, Debug)]
@@ -31,6 +32,22 @@ struct Args {
     /// Serve results over HTTP on this port instead of writing files
     #[arg(long)]
     serve: Option<u16>,
+
+    /// Run the binary after the analysis and list the functions that executed
+    #[arg(long)]
+    run: bool,
+
+    /// Tracing engine for --run: ptrace or valgrind
+    #[arg(long, default_value = "ptrace")]
+    engine: String,
+
+    /// File whose content goes to the binary's stdin under --run
+    #[arg(long)]
+    stdin: Option<String>,
+
+    /// Arguments for the binary under --run, after "--"
+    #[arg(last = true, value_name = "ARGS")]
+    run_args: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -39,6 +56,8 @@ struct Report<'a> {
     info: &'a binary::BinaryInfo,
     functions: &'a [binary::Function],
     graph: callgraph::GraphExport,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trace: Option<&'a TraceResult>,
 }
 
 #[tokio::main]
@@ -101,6 +120,19 @@ async fn main() {
         graph.edge_count()
     );
 
+    let export = graph.export();
+    let target = Target::new(
+        path.clone(),
+        info.entry_point,
+        &functions,
+        &plt_names,
+        &export.nodes,
+    );
+    let trace = args.run.then(|| run_target(&args, &target));
+    if let Some(trace) = &trace {
+        print_trace(trace, &args.engine, &export.nodes);
+    }
+
     let dot = graph.to_dot();
     fs::write(&args.output, &dot).expect("can't write dot file");
     println!("DOT saved to {}", args.output);
@@ -111,6 +143,7 @@ async fn main() {
             info: &info,
             functions: &functions,
             graph: graph.export(),
+            trace: trace.as_ref(),
         };
         let json = serde_json::to_string_pretty(&report).expect("can't serialize report");
         fs::write(json_path, json).expect("can't write json");
@@ -123,16 +156,52 @@ async fn main() {
             info: &info,
             functions: &functions,
             graph: graph.export(),
+            trace: None,
         };
         let report_json = serde_json::to_string(&report).expect("can't serialize report");
-        let state = server::AppState::new(
-            path.clone(),
-            info,
-            functions,
-            plt_names,
-            graph.export(),
-            report_json,
-        );
+        let state =
+            server::AppState::new(path.clone(), info, functions, target, export, report_json);
         server::serve(state, port).await;
     }
+}
+
+fn run_target(args: &Args, target: &Target) -> TraceResult {
+    let Some(engine) = Engine::parse(&args.engine) else {
+        eprintln!("unknown engine: {}", args.engine);
+        std::process::exit(2);
+    };
+    let stdin = args.stdin.as_ref().map(|file| {
+        String::from_utf8_lossy(&fs::read(file).expect("can't read stdin file")).into_owned()
+    });
+    let input = InputSpec {
+        stdin,
+        args: args.run_args.clone(),
+        input_file: None,
+    };
+    engine.run(target, &input)
+}
+
+fn print_trace(trace: &TraceResult, engine: &str, nodes: &[callgraph::Node]) {
+    let outcome = match (&trace.error, trace.exit_code) {
+        (Some(error), _) => error.clone(),
+        (None, Some(code)) => format!("exit code {}", code),
+        (None, None) => "no exit code".to_string(),
+    };
+    println!("Trace ({}): {}", engine, outcome);
+
+    let mut by_hits: Vec<(&str, u64)> = trace
+        .node_hits
+        .iter()
+        .map(|(&id, &hits)| (nodes[id].name.as_str(), hits))
+        .collect();
+    by_hits.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    println!("  {:<24} {:>10}", "NAME", "HITS");
+    for (name, hits) in by_hits {
+        println!("  {:<24} {:>10}", name, hits);
+    }
+    println!(
+        "  executed: {} nodes, {} edges",
+        trace.executed_nodes.len(),
+        trace.executed_edges.len()
+    );
 }

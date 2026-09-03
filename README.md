@@ -13,13 +13,20 @@ instrumentation and a hardening checklist.
 ## Usage
 
 ```
-Usage: binary2graph [OPTIONS] <BINARY>
+Usage: binary2graph [OPTIONS] <BINARY> [-- <ARGS>...]
+
+Arguments:
+  <BINARY>   Path to the binary to analyze
+  [ARGS]...  Arguments for the binary under --run, after "--"
 
 Options:
   -o, --output <OUTPUT>  Where to write the DOT graph file [default: callgraph.dot]
       --no-info          Skip the binary info passport (print only graph and stats)
       --json <JSON>      Write full analysis as JSON to this path
       --serve <SERVE>    Serve results over HTTP on this port instead of writing files
+      --run              Run the binary after the analysis and list the functions that executed
+      --engine <ENGINE>  Tracing engine for --run: ptrace or valgrind [default: ptrace]
+      --stdin <STDIN>    File whose content goes to the binary's stdin under --run
 ```
 
 ```
@@ -28,6 +35,8 @@ gcc -no-pie -o test/test_calc test/test_calc.c
 binary2graph test/test_target
 binary2graph test/test_calc --no-info -o app.dot --json app.json
 binary2graph test/test_calc --serve 8080
+binary2graph test/test_calc --run --engine valgrind --json calc.json
+binary2graph app --run --stdin input.txt -- --verbose
 ```
 
 The DOT file renders with graphviz: `dot -Tsvg callgraph.dot -o callgraph.svg`.
@@ -105,6 +114,12 @@ Engines:
 Both engines report the same shape: executed nodes and edges with counts, the
 exit code or the signal that killed the program, and stdout and stderr cut at
 16 KiB each. A run is killed after 10 seconds, and runs are serialised.
+
+The same run works without the browser: `--run` traces the binary right after
+the analysis and prints the executed functions with their hit counts under the
+graph totals; `--engine` picks the engine, `--stdin FILE` feeds a file to its
+stdin and its own arguments go after `--`. With `--json` the report gains a
+`trace` object of the shape `/api/run` returns.
 
 `--serve` with a run is code execution: the binary runs as the user who
 started the server, with input taken from the page. Serve only binaries you
