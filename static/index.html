@@ -236,8 +236,6 @@ let nodeIndex = new Map();
 let functions = new Map();
 let functionList = [];
 let entryPoint = 0;
-let callers = [];
-let callees = [];
 let inDeg = [];
 let outDeg = [];
 let fullGraph = false;
@@ -246,21 +244,31 @@ let history = [];
 const filters = { hidePlt: false, collapse: false, minDegree: 0 };
 let cy = null;
 
-fetch("/api/report")
-  .then((r) => r.json())
+api("/api/meta")
   .then(init)
   .catch(() => {
     document.getElementById("header").textContent = "can't load report";
   });
 
-function init(report) {
-  nodes = report.graph.nodes;
+function api(path) {
+  return fetch(path).then((r) => {
+    if (!r.ok) {
+      throw new Error(r.statusText);
+    }
+    return r.json();
+  });
+}
+
+// The meta body carries every node with its degrees but no edges, which only arrive per neighbourhood.
+function init(meta) {
+  nodes = meta.nodes;
   nodeIndex = new Map(nodes.map((n, i) => [n.name, i]));
-  functionList = report.functions;
+  inDeg = nodes.map((n) => n.in_degree);
+  outDeg = nodes.map((n) => n.out_degree);
+  functionList = meta.functions;
   functions = new Map(functionList.map((f) => [f.name, f]));
-  entryPoint = report.info.entry_point;
-  indexEdges(report.graph.edges);
-  renderHeader(report);
+  entryPoint = meta.info.entry_point;
+  renderHeader(meta);
   createGraph();
   bindSearch();
   getRoots().then(renderRoots);
@@ -273,20 +281,6 @@ function init(report) {
     showAll();
   } else {
     showSeed(defaultSeed());
-  }
-}
-
-// In/out counts and caller/callee lists come from the edge list, not from the function metrics.
-function indexEdges(edges) {
-  inDeg = nodes.map(() => 0);
-  outDeg = nodes.map(() => 0);
-  callers = nodes.map(() => new Set());
-  callees = nodes.map(() => new Set());
-  for (const [source, target] of edges) {
-    outDeg[source] += 1;
-    inDeg[target] += 1;
-    callees[source].add(target);
-    callers[target].add(source);
   }
 }
 
@@ -304,41 +298,15 @@ function entryNode() {
   return entry && nodeIndex.has(entry.name) ? nodeIndex.get(entry.name) : null;
 }
 
-// Search and roots go through these two so the source can move to the server without touching the UI.
 function searchNames(query) {
-  const needle = query.toLowerCase();
-  const matches = [];
-  if (needle === "") {
-    return Promise.resolve({ matches, total: 0 });
+  if (query === "") {
+    return Promise.resolve({ matches: [], total: 0 });
   }
-  for (const f of functionList) {
-    const at = f.name.toLowerCase().indexOf(needle);
-    if (at >= 0) {
-      const id = nodeIndex.has(f.name) ? nodeIndex.get(f.name) : null;
-      matches.push({ name: f.name, kind: "Local", id, address: f.address, at });
-    }
-  }
-  nodes.forEach((n, id) => {
-    const at = n.name.toLowerCase().indexOf(needle);
-    if (at >= 0 && n.kind !== "Local") {
-      matches.push({ name: n.name, kind: n.kind, id, address: null, at });
-    }
-  });
-  matches.sort((a, b) => a.at - b.at || a.name.localeCompare(b.name));
-  return Promise.resolve({ matches: matches.slice(0, SEARCH_LIMIT), total: matches.length });
+  return api("/api/search?q=" + encodeURIComponent(query));
 }
 
 function getRoots() {
-  const entry = entryNode();
-  const exported = functionList
-    .filter((f) => f.exported && nodeIndex.has(f.name))
-    .map((f) => nodeIndex.get(f.name));
-  const top = nodes
-    .map((n, id) => id)
-    .filter((id) => nodes[id].kind === "Local" && inDeg[id] > 0)
-    .sort((a, b) => inDeg[b] - inDeg[a] || a - b)
-    .slice(0, TOP_ROOTS);
-  return Promise.resolve({ entry: entry === null ? [] : [entry], exported, top });
+  return api("/api/roots");
 }
 
 function renderRoots(roots) {
@@ -410,14 +378,14 @@ function showFunction(name) {
   document.getElementById("node").replaceChildren(el("h2", name), rows, hint);
 }
 
-function renderHeader(report) {
-  const info = report.info;
+function renderHeader(meta) {
+  const info = meta.info;
   const rest = [info.architecture, info.kind, info.stripped ? "stripped" : "not stripped"];
   const names = info.instrumentation.map((d) => d.name);
   if (names.length) {
     rest.push(names.join(", "));
   }
-  const path = el("span", report.binary);
+  const path = el("span", meta.binary);
   path.className = "path";
   const header = document.getElementById("header");
   header.replaceChildren(path, document.createTextNode("  ·  " + rest.join("  ·  ")));
@@ -609,16 +577,13 @@ function fold(folded, position) {
   return position ? cy.collection() : meta;
 }
 
+// A graph this small is cheaper to fetch whole than to walk one neighbourhood at a time.
 function showAll() {
-  const all = nodes.map((_, id) => ({ id, hasMore: false }));
-  const edges = [];
-  callees.forEach((targets, source) => {
-    for (const target of targets) {
-      edges.push([source, target]);
-    }
+  api("/api/report").then((report) => {
+    const all = nodes.map((_, id) => ({ id, hasMore: false }));
+    merge({ nodes: all, edges: report.graph.edges, truncated: false });
+    layout();
   });
-  merge({ nodes: all, edges, truncated: false });
-  layout();
 }
 
 function showSeed(index) {
@@ -697,7 +662,7 @@ function expand(index) {
     if (added.length) {
       place(index, added.union(applyFilters()));
     }
-  });
+  }).catch(() => setStatus("can't load neighbours of " + nodes[index].name));
 }
 
 // Only the new nodes get placed, one rank above or below the node they came from, so the rest of the
@@ -769,58 +734,12 @@ function freeSpan(wanted, width, others) {
 
 // Every neighbour lookup goes through here so the source can move to the server without touching the UI.
 function getNeighbors(seed, depth, dir, budget) {
-  return Promise.resolve(neighborhood(seed, depth, dir, budget));
-}
-
-function neighborhood(seed, depth, dir, budget) {
-  const visited = new Set([seed]);
-  let frontier = [seed];
-  let truncated = false;
-  for (let level = 0; level < depth && frontier.length && !truncated; level++) {
-    const next = [];
-    for (const index of frontier) {
-      for (const neighbor of adjacent(index, dir)) {
-        if (visited.has(neighbor)) {
-          continue;
-        }
-        if (visited.size >= budget) {
-          truncated = true;
-          break;
-        }
-        visited.add(neighbor);
-        next.push(neighbor);
-      }
-      if (truncated) {
-        break;
-      }
-    }
-    frontier = next;
-  }
-
-  // Edges to nodes outside the visited set are left out: the "+" marker stands in for them.
-  const edges = [];
-  for (const source of visited) {
-    for (const target of callees[source]) {
-      if (visited.has(target)) {
-        edges.push([source, target]);
-      }
-    }
-  }
-  const result = [...visited].map((id) => ({
-    id,
-    hasMore: [...adjacent(id, "both")].some((n) => !visited.has(n)),
+  const query = "id=" + seed + "&depth=" + depth + "&dir=" + dir + "&budget=" + budget;
+  return api("/api/neighbors?" + query).then((result) => ({
+    nodes: result.nodes.map((n) => ({ id: n.id, hasMore: n.has_more })),
+    edges: result.edges,
+    truncated: result.truncated,
   }));
-  return { nodes: result, edges, truncated };
-}
-
-function adjacent(index, dir) {
-  if (dir === "out") {
-    return callees[index];
-  }
-  if (dir === "in") {
-    return callers[index];
-  }
-  return new Set([...callers[index], ...callees[index]]);
 }
 
 function merge(result) {
@@ -851,13 +770,15 @@ function merge(result) {
   }
 
   const freshEdges = [];
+  const seen = new Set();
   for (const [source, target] of result.edges) {
     const id = source + "-" + target;
     const ends = [cy.getElementById(String(source)), cy.getElementById(String(target))];
     if (ends.some((end) => end.empty())) {
       // The scene limit dropped one end, so the other one is where the rest can still be reached.
       ends.filter((end) => end.nonempty()).forEach((end) => setMore(end, true));
-    } else if (cy.getElementById(id).empty()) {
+    } else if (cy.getElementById(id).empty() && !seen.has(id)) {
+      seen.add(id);
       freshEdges.push({
         group: "edges",
         data: { id, source: String(source), target: String(target) },

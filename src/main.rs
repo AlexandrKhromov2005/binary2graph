@@ -123,9 +123,9 @@ async fn main() {
             functions: &functions,
             graph: graph.export(),
         };
-        let state = server::AppState {
-            report_json: serde_json::to_string(&report).expect("can't serialize report"),
-        };
+        let report_json = serde_json::to_string(&report).expect("can't serialize report");
+        let state =
+            server::AppState::new(path.clone(), info, functions, graph.export(), report_json);
         server::serve(state, port).await;
     }
 }
