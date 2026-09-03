@@ -7,7 +7,10 @@ use object::{
     read::elf::{ElfFile, ProgramHeader},
 };
 use serde::Serialize;
-use std::{collections::HashMap, fmt};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+};
 
 type Elf64<'a> = ElfFile<'a, FileHeader64<Endianness>>;
 
@@ -16,6 +19,7 @@ pub struct Function {
     pub name: String,
     pub address: u64,
     pub size: u64,
+    pub exported: bool,
     pub instructions: u32,
     pub calls_out: u32,
 }
@@ -61,6 +65,13 @@ pub struct Hardening {
 }
 
 pub fn load_functions(file: &object::File) -> Vec<Function> {
+    // A global binding in .symtab does not make a function exported; only .dynsym does.
+    let exported: HashSet<u64> = file
+        .dynamic_symbols()
+        .filter(|s| s.kind() == SymbolKind::Text && s.is_definition())
+        .map(|s| s.address())
+        .collect();
+
     let mut functions = Vec::new();
     for symbol in file.symbols() {
         if symbol.kind() == SymbolKind::Text && symbol.address() != 0 {
@@ -68,6 +79,7 @@ pub fn load_functions(file: &object::File) -> Vec<Function> {
                 name: symbol.name().unwrap_or("<unknown>").to_string(),
                 address: symbol.address(),
                 size: symbol.size(),
+                exported: exported.contains(&symbol.address()),
                 instructions: 0,
                 calls_out: 0,
             });
