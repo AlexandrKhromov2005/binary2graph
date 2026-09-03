@@ -82,6 +82,36 @@ when either cut applies.
 
 ![binary2graph web UI](docs/webui.png)
 
+## Running the target
+
+The `run` box in the panel executes the analysed binary and draws what ran on
+top of the static graph. Pick an engine, type stdin and arguments, attach an
+input file if the program reads one (`@@` among the arguments stands for its
+path, otherwise the path goes last) and press `run`. Executed functions get a
+green border and a `×N` call count, executed edges turn green with their own
+count, and the node details show `hits`. The `trace` toggle hides the overlay
+and `only executed` cuts the scene down to what ran. In explorer mode the
+executed functions are added to the scene first, within the scene limit.
+
+Engines:
+
+- `ptrace` plants a breakpoint on every function entry and PLT stub, reads the
+  caller from the return address on each hit and follows threads and forks.
+  No dependencies, but a call-heavy program slows down a lot.
+- `valgrind` runs `valgrind --tool=callgrind` and reads the call counts from
+  the dump, matched to the graph by address. Needs valgrind installed; the
+  page says so when it is missing.
+
+Both engines report the same shape: executed nodes and edges with counts, the
+exit code or the signal that killed the program, and stdout and stderr cut at
+16 KiB each. A run is killed after 10 seconds, and runs are serialised.
+
+`--serve` with a run is code execution: the binary runs as the user who
+started the server, with input taken from the page. Serve only binaries you
+trust, and prefer a VM or a container for anything else. The server listens on
+`127.0.0.1` and takes runs only as `application/json` POSTs, which keeps a
+page from another site from starting one.
+
 ## HTTP API
 
 - `/api/meta`: passport, function table and every graph node with its in/out
@@ -95,6 +125,11 @@ when either cut applies.
 - `/api/roots`: node ids of the entry point, exported functions and the ten most
   called local functions.
 - `/api/report`: the same report that `--json` writes.
+- `POST /api/run`: body `{"engine": "ptrace" | "valgrind", "stdin": text,
+  "args": [...], "input_file": base64}`, everything but `engine` optional.
+  Returns `executed_nodes`, `executed_edges`, `node_hits` keyed by node id,
+  `edge_hits` keyed by `from-to`, `exit_code`, `stdout`, `stderr` and `error`.
+  A crash or timeout still returns what ran before it, with `error` set.
 
 ## What the passport reports
 
@@ -122,6 +157,15 @@ when either cut applies.
   built without `-rdynamic`.
 - The explorer shows at most 200 neighbours per click; the rest of a hub's
   callers are reachable through search only.
+- A run counts calls into functions of the graph only. A callback invoked from
+  a library, such as a `qsort` comparator, gets its hits but no edge, and calls
+  from an `Unknown` node are never seen.
+- Under `ptrace` a tail call keeps the original return address on the stack,
+  so the edge is drawn from the function that made the first call, and a
+  breakpoint hit in one thread can go unseen while another thread steps over
+  the same entry.
+- Under `valgrind` the target runs tens of times slower, so a program that
+  takes more than a fraction of a second natively hits the 10 second limit.
 
 ## How it works
 
@@ -129,4 +173,7 @@ when either cut applies.
 relocations; `iced-x86` decodes each function body to count instructions and
 collect call targets; `petgraph` holds the graph and emits the DOT; `serde_json`
 serialises the full report, and `axum` serves it next to the embedded page,
-answering neighbourhood queries from adjacency lists built at start-up.
+answering neighbourhood queries from adjacency lists built at start-up. A run
+maps runtime addresses back to graph nodes through the function ranges and PLT
+stub addresses found during analysis; `nix` wraps the ptrace calls, and the
+callgrind dump is parsed by the server itself.

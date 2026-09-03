@@ -396,6 +396,8 @@ fn hit(
         .node_at(return_address.wrapping_sub(1).wrapping_sub(bias));
     trace.call(caller, breakpoint.node, 1);
 
+    // While the original byte is back for the step, another thread can run through the entry
+    // unseen, so a busy multithreaded target counts a little low.
     poke_byte(who, address, breakpoint.original)?;
     regs.rip = address;
     ptrace::setregs(who, regs)?;
