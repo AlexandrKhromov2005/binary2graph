@@ -63,6 +63,20 @@
   #controls button:hover {
     background: #eee;
   }
+  #controls label {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    height: 26px;
+    padding: 0 6px;
+    border: 1px solid #ccc;
+    background: #fff;
+    box-sizing: border-box;
+  }
+  #controls input[type="number"] {
+    width: 3em;
+    font: inherit;
+  }
   #status {
     padding-left: 6px;
     line-height: 26px;
@@ -155,6 +169,9 @@
       <button id="zoom-in" title="zoom in (+)">+</button>
       <button id="zoom-out" title="zoom out (-)">-</button>
       <button id="zoom-fit" title="fit the whole graph (0)">fit</button>
+      <label><input type="checkbox" id="hide-plt"> hide plt</label>
+      <label><input type="checkbox" id="collapse"> collapse external</label>
+      <label>min degree <input type="number" id="min-degree" min="0" value="0"></label>
       <span id="status"></span>
     </div>
   </div>
@@ -178,6 +195,7 @@ const FULL_GRAPH_LIMIT = 300;
 const BUDGET = 200;
 const SEARCH_LIMIT = 50;
 const TOP_ROOTS = 10;
+const SCENE_LIMIT = 500;
 
 let nodes = [];
 let nodeIndex = new Map();
@@ -189,6 +207,8 @@ let callees = [];
 let inDeg = [];
 let outDeg = [];
 let fullGraph = false;
+let seed = null;
+const filters = { hidePlt: false, collapse: false, minDegree: 0 };
 let cy = null;
 
 fetch("/api/report")
@@ -406,11 +426,19 @@ function createGraph() {
         },
       },
       { selector: ".active", style: { "border-width": 3, "border-color": "#333" } },
+      { selector: ".hidden", style: { "display": "none" } },
     ],
   });
 
   bindControls();
-  cy.on("tap", "node", (event) => select(Number(event.target.id()), false));
+  bindFilters();
+  cy.on("tap", "node", (event) => {
+    if (event.target.hasClass("meta")) {
+      setCollapse(false);
+    } else {
+      select(Number(event.target.id()), false);
+    }
+  });
   cy.on("tap", (event) => {
     if (event.target === cy) {
       reset();
@@ -445,7 +473,87 @@ function zoomBy(factor) {
 }
 
 function fit() {
-  cy.fit(undefined, 20);
+  cy.fit(shown(), 20);
+}
+
+// Cytoscape caches visibility until the next render, so the hidden class is the source of truth here.
+function shown() {
+  const visible = cy.nodes().not(".hidden");
+  const edges = visible.connectedEdges().filter((e) => !e.source().hasClass("hidden") && !e.target().hasClass("hidden"));
+  return visible.union(edges);
+}
+
+function bindFilters() {
+  document.getElementById("hide-plt").addEventListener("change", (event) => {
+    filters.hidePlt = event.target.checked;
+    refilter();
+  });
+  document.getElementById("collapse").addEventListener("change", (event) => {
+    filters.collapse = event.target.checked;
+    refilter();
+  });
+  document.getElementById("min-degree").addEventListener("input", (event) => {
+    filters.minDegree = Number(event.target.value) || 0;
+    refilter();
+  });
+}
+
+function setCollapse(on) {
+  document.getElementById("collapse").checked = on;
+  filters.collapse = on;
+  refilter();
+}
+
+function refilter() {
+  applyFilters();
+  layout();
+}
+
+// Filtered nodes stay in the scene but hidden, so switching a filter off needs no new lookup.
+function applyFilters() {
+  const folded = [];
+  cy.remove(".meta");
+  for (const node of cy.nodes()) {
+    const id = Number(node.id());
+    const kind = node.data("kind");
+    let hidden = false;
+    if (kind === "Plt" && filters.hidePlt) {
+      hidden = true;
+    } else if (kind !== "Local" && filters.collapse) {
+      hidden = true;
+      folded.push(node);
+    } else if (id !== seed && inDeg[id] + outDeg[id] < filters.minDegree) {
+      hidden = true;
+    }
+    node.toggleClass("hidden", hidden);
+  }
+  if (folded.length) {
+    fold(folded);
+  }
+}
+
+// Plt and unknown nodes are only ever callees, so every edge into the group points at the one node.
+function fold(folded) {
+  cy.add({
+    group: "nodes",
+    classes: "meta",
+    data: { id: "external", label: "external (" + folded.length + ")", color: KINDS.Plt.color, shape: "rectangle" },
+  });
+  const sources = new Set();
+  for (const node of folded) {
+    for (const edge of node.incomers("edge")) {
+      if (!edge.source().hasClass("hidden")) {
+        sources.add(edge.source().id());
+      }
+    }
+  }
+  for (const id of sources) {
+    cy.add({
+      group: "edges",
+      classes: "meta",
+      data: { id: id + "-external", source: id, target: "external" },
+    });
+  }
 }
 
 function showAll() {
@@ -466,6 +574,7 @@ function showSeed(index) {
     return;
   }
   cy.elements().remove();
+  seed = index;
   expand(index).then(() => {
     fit();
     highlight(index);
@@ -486,10 +595,17 @@ function select(index, center) {
 
 function expand(index) {
   return getNeighbors(index, 1, "both", BUDGET).then((result) => {
-    const added = merge(result);
-    const name = nodes[index].name;
-    setStatus(result.truncated ? "neighbourhood of " + name + " cut at " + BUDGET + " nodes" : "");
+    const { added, skipped } = merge(result);
+    const notes = [];
+    if (result.truncated) {
+      notes.push("neighbourhood of " + nodes[index].name + " cut at " + BUDGET + " nodes");
+    }
+    if (skipped) {
+      notes.push("scene limit of " + SCENE_LIMIT + " nodes reached, " + skipped + " left out");
+    }
+    setStatus(notes.join("; "));
     if (added.length) {
+      applyFilters();
       layout();
     }
   });
@@ -568,25 +684,31 @@ function merge(result) {
     fresh.push({ id, hasMore });
     freshNodes.push({
       group: "nodes",
-      data: { id: String(id), name: node.name, color: style.color, shape: style.shape },
+      data: { id: String(id), name: node.name, kind: node.kind, color: style.color, shape: style.shape },
     });
   }
-  const added = cy.add(freshNodes);
-  for (const { id, hasMore } of fresh) {
+  const room = Math.max(0, SCENE_LIMIT - cy.nodes().not(".meta").length);
+  const skipped = Math.max(0, freshNodes.length - room);
+  const added = cy.add(freshNodes.slice(0, room));
+  for (const { id, hasMore } of fresh.slice(0, room)) {
     setMore(cy.getElementById(String(id)), hasMore);
   }
 
   const freshEdges = [];
   for (const [source, target] of result.edges) {
     const id = source + "-" + target;
-    if (cy.getElementById(id).empty()) {
+    const ends = [cy.getElementById(String(source)), cy.getElementById(String(target))];
+    if (ends.some((end) => end.empty())) {
+      // The scene limit dropped one end, so the other one is where the rest can still be reached.
+      ends.filter((end) => end.nonempty()).forEach((end) => setMore(end, true));
+    } else if (cy.getElementById(id).empty()) {
       freshEdges.push({
         group: "edges",
         data: { id, source: String(source), target: String(target) },
       });
     }
   }
-  return added.union(cy.add(freshEdges));
+  return { added: added.union(cy.add(freshEdges)), skipped };
 }
 
 function setMore(node, more) {
@@ -595,7 +717,7 @@ function setMore(node, more) {
 }
 
 function layout() {
-  cy.layout({ name: "breadthfirst", directed: true, spacingFactor: 0.8, padding: 20 }).run();
+  shown().layout({ name: "breadthfirst", directed: true, spacingFactor: 0.8, padding: 20 }).run();
 }
 
 function highlight(index) {
@@ -637,7 +759,7 @@ function renderPanel(index) {
 }
 
 function sceneIds(collection) {
-  return collection.map((n) => Number(n.id())).sort(byName);
+  return collection.not(".meta").map((n) => Number(n.id())).sort(byName);
 }
 
 function byName(a, b) {
