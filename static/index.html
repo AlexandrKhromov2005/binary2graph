@@ -63,6 +63,11 @@
   #controls button:hover {
     background: #eee;
   }
+  #status {
+    padding-left: 6px;
+    line-height: 26px;
+    color: #a00;
+  }
   #panel {
     flex: none;
     width: 260px;
@@ -128,6 +133,7 @@
       <button id="zoom-in" title="zoom in (+)">+</button>
       <button id="zoom-out" title="zoom out (-)">-</button>
       <button id="zoom-fit" title="fit the whole graph (0)">fit</button>
+      <span id="status"></span>
     </div>
   </div>
   <div id="panel"></div>
@@ -138,8 +144,12 @@ const KINDS = {
   Plt: { color: "#ffcc99", shape: "rectangle" },
   Unknown: { color: "#dddddd", shape: "ellipse" },
 };
+// Past this many nodes the page starts from one seed instead of drawing the whole graph.
+const FULL_GRAPH_LIMIT = 300;
+const BUDGET = 200;
 
 let nodes = [];
+let nodeIndex = new Map();
 let functions = new Map();
 let callers = [];
 let callees = [];
@@ -156,11 +166,20 @@ fetch("/api/report")
 
 function init(report) {
   nodes = report.graph.nodes;
+  nodeIndex = new Map(nodes.map((n, i) => [n.name, i]));
   functions = new Map(report.functions.map((f) => [f.name, f]));
   indexEdges(report.graph.edges);
   renderHeader(report);
-  renderGraph(report.graph);
+  createGraph();
   reset();
+  if (nodes.length === 0) {
+    return;
+  }
+  if (nodes.length <= FULL_GRAPH_LIMIT) {
+    showAll();
+  } else {
+    showSeed(defaultSeed(report));
+  }
 }
 
 // In/out counts and caller/callee lists come from the edge list, not from the function metrics.
@@ -177,6 +196,17 @@ function indexEdges(edges) {
   }
 }
 
+// The ELF entry point only calls __libc_start_main, so main is the better start when present.
+function defaultSeed(report) {
+  const entry = report.functions.find((f) => f.address === report.info.entry_point);
+  for (const name of ["main", entry ? entry.name : ""]) {
+    if (nodeIndex.has(name)) {
+      return nodeIndex.get(name);
+    }
+  }
+  return outDeg.indexOf(Math.max(...outDeg));
+}
+
 function renderHeader(report) {
   const info = report.info;
   const rest = [info.architecture, info.kind, info.stripped ? "stripped" : "not stripped"];
@@ -190,21 +220,9 @@ function renderHeader(report) {
   header.replaceChildren(path, document.createTextNode("  ·  " + rest.join("  ·  ")));
 }
 
-function renderGraph(graph) {
-  const elements = {
-    nodes: graph.nodes.map((n, i) => {
-      const style = KINDS[n.kind] || KINDS.Unknown;
-      return { data: { id: String(i), name: n.name, color: style.color, shape: style.shape } };
-    }),
-    edges: graph.edges.map(([source, target], i) => ({
-      data: { id: "e" + i, source: String(source), target: String(target) },
-    })),
-  };
-
+function createGraph() {
   cy = cytoscape({
     container: document.getElementById("cy"),
-    elements: elements,
-    layout: { name: "breadthfirst", directed: true, spacingFactor: 0.8, padding: 20 },
     // dragging a node would pull it out of the layout, so pan instead
     autoungrabify: true,
     wheelSensitivity: 0.2,
@@ -214,7 +232,7 @@ function renderGraph(graph) {
       {
         selector: "node",
         style: {
-          "label": "data(name)",
+          "label": "data(label)",
           "background-color": "data(color)",
           "shape": "data(shape)",
           "border-width": 1,
@@ -240,7 +258,6 @@ function renderGraph(graph) {
         },
       },
       { selector: ".active", style: { "border-width": 3, "border-color": "#333" } },
-      { selector: ".dim", style: { "opacity": 0.15 } },
     ],
   });
 
@@ -280,21 +297,164 @@ function fit() {
   cy.fit(undefined, 20);
 }
 
+function showAll() {
+  const all = nodes.map((_, id) => ({ id, hasMore: false }));
+  const edges = [];
+  callees.forEach((targets, source) => {
+    for (const target of targets) {
+      edges.push([source, target]);
+    }
+  });
+  merge({ nodes: all, edges, truncated: false });
+  layout();
+}
+
+function showSeed(index) {
+  cy.elements().remove();
+  expand(index).then(() => {
+    fit();
+    highlight(index);
+    renderPanel(index);
+  });
+}
+
 // Recentre only when the node was picked from the panel, where it may be off screen.
 function select(index, center) {
-  const node = cy.getElementById(String(index));
-  cy.elements().removeClass("active dim");
-  cy.elements().difference(node.closedNeighborhood()).addClass("dim");
-  node.addClass("active");
-  if (center) {
-    cy.center(node);
+  expand(index).then(() => {
+    highlight(index);
+    if (center) {
+      cy.center(cy.getElementById(String(index)));
+    }
+    renderPanel(index);
+  });
+}
+
+function expand(index) {
+  return getNeighbors(index, 1, "both", BUDGET).then((result) => {
+    const added = merge(result);
+    const name = nodes[index].name;
+    setStatus(result.truncated ? "neighbourhood of " + name + " cut at " + BUDGET + " nodes" : "");
+    if (added.length) {
+      layout();
+    }
+  });
+}
+
+// Every neighbour lookup goes through here so the source can move to the server without touching the UI.
+function getNeighbors(seed, depth, dir, budget) {
+  return Promise.resolve(neighborhood(seed, depth, dir, budget));
+}
+
+function neighborhood(seed, depth, dir, budget) {
+  const visited = new Set([seed]);
+  let frontier = [seed];
+  let truncated = false;
+  for (let level = 0; level < depth && frontier.length && !truncated; level++) {
+    const next = [];
+    for (const index of frontier) {
+      for (const neighbor of adjacent(index, dir)) {
+        if (visited.has(neighbor)) {
+          continue;
+        }
+        if (visited.size >= budget) {
+          truncated = true;
+          break;
+        }
+        visited.add(neighbor);
+        next.push(neighbor);
+      }
+      if (truncated) {
+        break;
+      }
+    }
+    frontier = next;
   }
-  renderPanel(index);
+
+  // Edges to nodes outside the visited set are left out: the "+" marker stands in for them.
+  const edges = [];
+  for (const source of visited) {
+    for (const target of callees[source]) {
+      if (visited.has(target)) {
+        edges.push([source, target]);
+      }
+    }
+  }
+  const result = [...visited].map((id) => ({
+    id,
+    hasMore: [...adjacent(id, "both")].some((n) => !visited.has(n)),
+  }));
+  return { nodes: result, edges, truncated };
+}
+
+function adjacent(index, dir) {
+  if (dir === "out") {
+    return callees[index];
+  }
+  if (dir === "in") {
+    return callers[index];
+  }
+  return new Set([...callers[index], ...callees[index]]);
+}
+
+function merge(result) {
+  const fresh = [];
+  const freshNodes = [];
+  for (const { id, hasMore } of result.nodes) {
+    const existing = cy.getElementById(String(id));
+    if (existing.nonempty()) {
+      // A node keeps its marker until one lookup has brought in all of its neighbours.
+      if (!hasMore) {
+        setMore(existing, false);
+      }
+      continue;
+    }
+    const node = nodes[id];
+    const style = KINDS[node.kind] || KINDS.Unknown;
+    fresh.push({ id, hasMore });
+    freshNodes.push({
+      group: "nodes",
+      data: { id: String(id), name: node.name, color: style.color, shape: style.shape },
+    });
+  }
+  const added = cy.add(freshNodes);
+  for (const { id, hasMore } of fresh) {
+    setMore(cy.getElementById(String(id)), hasMore);
+  }
+
+  const freshEdges = [];
+  for (const [source, target] of result.edges) {
+    const id = source + "-" + target;
+    if (cy.getElementById(id).empty()) {
+      freshEdges.push({
+        group: "edges",
+        data: { id, source: String(source), target: String(target) },
+      });
+    }
+  }
+  return added.union(cy.add(freshEdges));
+}
+
+function setMore(node, more) {
+  node.data("more", more);
+  node.data("label", more ? node.data("name") + " +" : node.data("name"));
+}
+
+function layout() {
+  cy.layout({ name: "breadthfirst", directed: true, spacingFactor: 0.8, padding: 20 }).run();
+}
+
+function highlight(index) {
+  cy.nodes().removeClass("active");
+  cy.getElementById(String(index)).addClass("active");
+}
+
+function setStatus(text) {
+  document.getElementById("status").textContent = text;
 }
 
 function reset() {
-  cy.elements().removeClass("active dim");
-  const hint = el("p", "click a node");
+  cy.nodes().removeClass("active");
+  const hint = el("p", "click a node to expand it");
   hint.className = "hint";
   document.getElementById("panel").replaceChildren(hint);
 }
@@ -315,9 +475,14 @@ function renderPanel(index) {
 
   const panel = document.getElementById("panel");
   panel.replaceChildren(el("h2", node.name), rows);
-  addList(panel, "callers", callers[index]);
-  addList(panel, "callees", callees[index]);
+  const scene = cy.getElementById(String(index));
+  addList(panel, "callers", sceneIds(scene.incomers("node")));
+  addList(panel, "callees", sceneIds(scene.outgoers("node")));
   panel.scrollTop = 0;
+}
+
+function sceneIds(collection) {
+  return collection.map((n) => Number(n.id()));
 }
 
 function addRow(rows, name, value) {
@@ -325,7 +490,7 @@ function addRow(rows, name, value) {
 }
 
 function addList(panel, title, indexes) {
-  if (indexes.size === 0) {
+  if (indexes.length === 0) {
     return;
   }
   const list = el("ul");
